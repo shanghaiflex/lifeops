@@ -1,0 +1,4 @@
+date,amount,currency,description,category,merchant,type
+2024-01-02,-12.50,EUR,Coffee,Food,Local Cafe,
+2024-01-05,-9.99,EUR,Spotify Premium,Subscriptions,Spotify,subscription
+2024-01-10,-45.00,EUR,Groceries,Food,Supermarket,
