@@ -36,19 +36,19 @@ func (m *mockSender) SendMessage(_ context.Context, _ int64, text string) error 
 func TestWorkerRunOnceUsesMockProvider(t *testing.T) {
 	provider := &llm.MockProvider{}
 	sender := &mockSender{}
-	report := DailyReport{Coach: "Coach text", Sleep: "Sleep text", Finance: "Finance text"}
+	report := DailyReport{Coach: "Coach text", Sleep: "Sleep text"}
 	payload, err := json.Marshal(report)
 	require.NoError(t, err)
 	provider.JSONResponse = string(payload)
 
 	w := New(&fakeStore{}, provider, sender, time.UTC, 123)
 	require.NoError(t, w.RunOnce(context.Background()))
-	require.Contains(t, sender.lastMessage, "Daily Digest")
+	require.Contains(t, sender.lastMessage, "Ежедневный отчёт")
 	require.Contains(t, sender.lastMessage, "Coach text")
 }
 
 func TestFormatTelegramMessageSnapshot(t *testing.T) {
-	report := DailyReport{Coach: "Coach", Sleep: "Sleep", Finance: "Finance"}
+	report := DailyReport{Coach: "Coach", Sleep: "Sleep"}
 	message := FormatTelegramMessage(report)
-	require.Equal(t, "Daily Digest\n\n🏋️ Coach\nCoach\n\n😴 Sleep & Recovery\nSleep\n\n💸 Finance\nFinance", message)
+	require.Equal(t, "Ежедневный отчёт\n\n🏋️ Тренер\nCoach\n\n😴 Сон и восстановление\nSleep", message)
 }

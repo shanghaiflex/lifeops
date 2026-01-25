@@ -9,7 +9,6 @@ import (
 
 type Config struct {
 	PostgresDSN     string
-	APIKey          string
 	TelegramToken   string
 	TelegramChatID  int64
 	LLMProvider     string
@@ -24,7 +23,6 @@ type Config struct {
 func Load() (*Config, error) {
 	cfg := &Config{
 		PostgresDSN:    os.Getenv("POSTGRES_DSN"),
-		APIKey:         os.Getenv("API_KEY"),
 		TelegramToken:  os.Getenv("TELEGRAM_BOT_TOKEN"),
 		LLMProvider:    os.Getenv("LLM_PROVIDER"),
 		OpenAIAPIKey:   os.Getenv("OPENAI_API_KEY"),

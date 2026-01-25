@@ -1,13 +1,24 @@
-.PHONY: up down migrate test test-integration worker-once ingest-finance openapi-generate
+POSTGRES_LOCAL_DSN ?= postgres://postgres:postgres@localhost:5432/lifeops?sslmode=disable
+
+.PHONY: up down migrate test test-integration worker-once ingest-finance openapi-generate wait-for-postgres
 
 up:
-	docker compose up -d --build
+	docker-compose up -d --build
+	@$(MAKE) wait-for-postgres
+	@$(MAKE) migrate
 
 down:
-	docker compose down
+	docker-compose down
 
 migrate:
-	go run ./cmd/migrate -cmd up
+	@echo "Running DB migrations..."
+	POSTGRES_DSN=$(POSTGRES_LOCAL_DSN) go run ./cmd/migrate -cmd up
+
+wait-for-postgres:
+	@echo "Waiting for Postgres to accept connections..."
+	@until docker-compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1; do \
+		sleep 1; \
+	done
 
 test:
 	go test ./...

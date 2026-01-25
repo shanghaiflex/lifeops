@@ -22,30 +22,25 @@ cp .env.example .env
 ```
 
 Minimum variables:
-- `POSTGRES_DSN`
-- `API_KEY` (for `X-Api-Key` header)
-- `TELEGRAM_BOT_TOKEN`
+- `POSTGRES_DSN` (leave the host as `postgres` so containers can reach it)
+- `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (optional unless you need Telegram features)
 - `LLM_PROVIDER=mock|openai`
 - `OPENAI_API_KEY` (required if `LLM_PROVIDER=openai`)
 - `OPENAI_MODEL` (default `gpt-5-mini`)
 - `TIMEZONE`
 
-### 2) Start services
+### 2) Start services (and run migrations automatically)
 
 ```bash
 make up
 ```
 
-### 3) Run migrations
-
-```bash
-make migrate
-```
+`make up` performs three actions: builds images, brings up the compose stack, waits for Postgres, and runs the SQL migrations via the exposed port on `localhost:5432`. If you ever need to re-run migrations manually you can call `make migrate` (it defaults to the same local DSN but can be overridden via `POSTGRES_LOCAL_DSN`).
 
 ## LAN iOS connection
 - API listens on `0.0.0.0:8080` by default (change with `BIND_ADDR`).
 - Set Health Bridge iOS app to send data to `http://<mac-ip>:8080`.
-- Provide header `X-Api-Key: <API_KEY>`.
+- There is no authentication for LAN testing, so you can hit the ingest endpoints directly.
 
 ## Finance CSV ingestion
 - Place CSV files in `./data/finance` (mounted into the container).
@@ -78,6 +73,15 @@ Commands:
 - `/whoami`
 - `/daily`
 - `/coach` / `/sleep` / `/finance`
+
+### Getting Telegram credentials
+1. Open Telegram and start a chat with [@BotFather](https://t.me/BotFather). Send `/newbot` and follow the prompts to name your bot. BotFather will return the `TELEGRAM_BOT_TOKEN`; drop it into `.env`.
+2. Send a message to your new bot from the account that should receive digests. Then query the updates API to discover the chat ID:
+   ```bash
+   curl "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates"
+   ```
+   Look for `"chat":{"id":123456789,...}` in the response and copy the numeric value into `TELEGRAM_CHAT_ID`.
+3. Restart the compose stack (`make up`) so the `bot` and `worker` services pick up the credentials.
 
 ## OpenAI provider
 Set:

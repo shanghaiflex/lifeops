@@ -11,9 +11,8 @@ import (
 )
 
 type DailyReport struct {
-	Coach   string `json:"coach"`
-	Sleep   string `json:"sleep"`
-	Finance string `json:"finance"`
+	Coach string `json:"coach"`
+	Sleep string `json:"sleep"`
 }
 
 type SummaryStore interface {
@@ -52,7 +51,6 @@ func (w *Worker) RunDaily(ctx context.Context) error {
 
 func (w *Worker) RunOnce(ctx context.Context) error {
 	since := time.Now().In(w.timezone).AddDate(0, 0, -7)
-	longer := time.Now().In(w.timezone).AddDate(0, 0, -30)
 
 	healthSummary, err := w.store.RecentHealthSummary(ctx, since)
 	if err != nil {
@@ -62,22 +60,21 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	financeSummary, err := w.store.RecentFinanceSummary(ctx, longer)
-	if err != nil {
-		return err
-	}
-	prompt := fmt.Sprintf(`You are generating a daily digest in JSON.
-Return a JSON object with keys coach, sleep, finance.
-Health summary: %s
-Metrics summary: %s
-Finance summary (last 30 days): %s`, healthSummary, metricsSummary, financeSummary)
+	prompt := fmt.Sprintf(`Ты дружелюбный ассистент и общаешься на русском в свободной форме.
+Составь короткий неформальный дайджест в формате JSON.
+Верни объект с ключами "coach" и "sleep".
+- "coach" описывает тренировки и активность.
+- "sleep" описывает сон и восстановление.
+Используй данные ниже:
+Заметки по тренировкам: %s
+Заметки по метрикам: %s`, healthSummary, metricsSummary)
 	jsonPayload, err := w.provider.GenerateJSON(ctx, prompt)
 	if err != nil {
 		return err
 	}
-	var report DailyReport
-	if err := json.Unmarshal([]byte(jsonPayload), &report); err != nil {
-		return fmt.Errorf("parse report json: %w", err)
+	report, err := parseDailyReport(jsonPayload)
+	if err != nil {
+		return err
 	}
 	if w.chatID == 0 {
 		return nil
@@ -87,5 +84,31 @@ Finance summary (last 30 days): %s`, healthSummary, metricsSummary, financeSumma
 }
 
 func FormatTelegramMessage(report DailyReport) string {
-	return fmt.Sprintf("Daily Digest\n\n🏋️ Coach\n%s\n\n😴 Sleep & Recovery\n%s\n\n💸 Finance\n%s", report.Coach, report.Sleep, report.Finance)
+	return fmt.Sprintf("Ежедневный отчёт\n\n🏋️ Тренер\n%s\n\n😴 Сон и восстановление\n%s", report.Coach, report.Sleep)
+}
+
+func parseDailyReport(payload string) (DailyReport, error) {
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
+		return DailyReport{}, fmt.Errorf("parse report json: %w", err)
+	}
+	report := DailyReport{
+		Coach: normalizeReportField(raw["coach"]),
+		Sleep: normalizeReportField(raw["sleep"]),
+	}
+	return report, nil
+}
+
+func normalizeReportField(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case nil:
+		return ""
+	default:
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+		return fmt.Sprint(v)
+	}
 }

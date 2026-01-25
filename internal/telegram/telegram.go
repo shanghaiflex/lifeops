@@ -114,10 +114,10 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) erro
 func buildChatPrompt(agent string, userMessage string) string {
 	switch agent {
 	case "sleep":
-		return "You are a sleep & recovery analyst. Answer succinctly. User: " + userMessage
+		return "Ты эксперт по сну и восстановлению. Говори по-русски, дружелюбно и неформально. Вопрос: " + userMessage
 	case "finance":
-		return "You are a finance analyst. Answer succinctly. User: " + userMessage
+		return "Ты финансовый консультант, но говоришь по-русски и без официоза. Вопрос: " + userMessage
 	default:
-		return "You are a sports coach. Answer succinctly. User: " + userMessage
+		return "Ты спортивный тренер. Отвечай на русском, легко и неформально. Вопрос: " + userMessage
 	}
 }

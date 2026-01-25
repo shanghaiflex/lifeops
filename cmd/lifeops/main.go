@@ -68,15 +68,14 @@ func buildProvider(cfg *config.Config) llm.Provider {
 
 func runAPI(ctx context.Context, cfg *config.Config, store *store.Store) {
 	healthSvc := health.NewService(store)
-	server, err := api.NewServer(healthSvc, cfg.APIKey)
+	server, err := api.NewServer(healthSvc)
 	if err != nil {
 		log.Fatalf("api server: %v", err)
 	}
-	mux := server.WithAPIKey()
 
 	httpServer := &http.Server{
 		Addr:         cfg.BindAddr,
-		Handler:      mux,
+		Handler:      server.Router(),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}

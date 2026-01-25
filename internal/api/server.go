@@ -10,10 +10,11 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/getkin/kin-openapi/openapi3filter"
+	"github.com/getkin/kin-openapi/routers"
+	"github.com/getkin/kin-openapi/routers/legacy"
 	"github.com/go-chi/chi/v5"
-	"github.com/kin-openapi/kin-openapi/openapi3"
-	"github.com/kin-openapi/kin-openapi/openapi3filter"
-	"github.com/kin-openapi/kin-openapi/routers/chi"
 	"lifeops/internal/health"
 )
 
@@ -22,11 +23,10 @@ var openapiFS embed.FS
 
 type Server struct {
 	service *health.Service
-	apiKey  string
 	router  *chi.Mux
 }
 
-func NewServer(service *health.Service, apiKey string) (*Server, error) {
+func NewServer(service *health.Service) (*Server, error) {
 	specBytes, err := openapiFS.ReadFile("openapi.yaml")
 	if err != nil {
 		return nil, fmt.Errorf("read openapi: %w", err)
@@ -37,11 +37,14 @@ func NewServer(service *health.Service, apiKey string) (*Server, error) {
 		return nil, fmt.Errorf("parse openapi: %w", err)
 	}
 	spec.Servers = nil
+	openapiRouter, err := legacy.NewRouter(spec)
+	if err != nil {
+		return nil, fmt.Errorf("build openapi router: %w", err)
+	}
 	router := chi.NewRouter()
-	router.Use(openapiMiddleware(spec))
+	router.Use(openapiMiddleware(openapiRouter))
 	s := &Server{
 		service: service,
-		apiKey:  apiKey,
 		router:  router,
 	}
 	s.routes()
@@ -114,8 +117,7 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	})
 }
 
-func openapiMiddleware(spec *openapi3.T) func(http.Handler) http.Handler {
-	validator, _ := chi.NewRouterFromOpenAPI(spec)
+func openapiMiddleware(validator routers.Router) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(r.URL.Path, "/healthz") {
@@ -148,30 +150,6 @@ func openapiMiddleware(spec *openapi3.T) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
-}
-
-func APIKeyMiddleware(apiKey string) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.HasPrefix(r.URL.Path, "/healthz") {
-				next.ServeHTTP(w, r)
-				return
-			}
-			if apiKey == "" {
-				next.ServeHTTP(w, r)
-				return
-			}
-			if r.Header.Get("X-Api-Key") != apiKey {
-				writeError(w, http.StatusUnauthorized, fmt.Errorf("invalid api key"))
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
-}
-
-func (s *Server) WithAPIKey() http.Handler {
-	return APIKeyMiddleware(s.apiKey)(s.router)
 }
 
 func Healthz(ctx context.Context, baseURL string) error {

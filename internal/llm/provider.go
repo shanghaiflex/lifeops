@@ -6,7 +6,9 @@ import (
 	"fmt"
 
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/responses"
+	"github.com/openai/openai-go/shared"
 )
 
 type Provider interface {
@@ -15,27 +17,35 @@ type Provider interface {
 }
 
 type OpenAIProvider struct {
-	client *openai.Client
+	client openai.Client
 	model  string
 }
 
 func NewOpenAIProvider(apiKey, model string) *OpenAIProvider {
-	client := openai.NewClient(openai.WithAPIKey(apiKey))
+	client := openai.NewClient(option.WithAPIKey(apiKey))
 	return &OpenAIProvider{client: client, model: model}
 }
 
 func (p *OpenAIProvider) GenerateJSON(ctx context.Context, prompt string) (string, error) {
-	resp, err := p.client.Responses.New(ctx, responses.NewParams{
-		Model: openai.F(p.model),
-		Input: openai.F([]responses.InputItemUnionParam{
-			responses.InputItemMessageParam{
-				Role: openai.F(responses.InputItemMessageRoleUser),
-				Content: openai.F([]responses.InputContentPartUnionParam{
-					responses.InputContentPartTextParam{Text: openai.F(prompt)},
-				}),
+	resp, err := p.client.Responses.New(ctx, responses.ResponseNewParams{
+		Model: shared.ResponsesModel(p.model),
+		Input: responses.ResponseNewParamsInputUnion{
+			OfInputItemList: responses.ResponseInputParam{
+				responses.ResponseInputItemUnionParam{
+					OfMessage: &responses.EasyInputMessageParam{
+						Role: responses.EasyInputMessageRoleUser,
+						Content: responses.EasyInputMessageContentUnionParam{
+							OfString: openai.String(prompt),
+						},
+					},
+				},
 			},
-		}),
-		ResponseFormat: openai.F(responses.ResponseFormatJSONObjectParam{}),
+		},
+		Text: responses.ResponseTextConfigParam{
+			Format: responses.ResponseFormatTextConfigUnionParam{
+				OfJSONObject: &shared.ResponseFormatJSONObjectParam{},
+			},
+		},
 	})
 	if err != nil {
 		return "", fmt.Errorf("openai generate json: %w", err)
@@ -44,16 +54,20 @@ func (p *OpenAIProvider) GenerateJSON(ctx context.Context, prompt string) (strin
 }
 
 func (p *OpenAIProvider) Chat(ctx context.Context, prompt string) (string, error) {
-	resp, err := p.client.Responses.New(ctx, responses.NewParams{
-		Model: openai.F(p.model),
-		Input: openai.F([]responses.InputItemUnionParam{
-			responses.InputItemMessageParam{
-				Role: openai.F(responses.InputItemMessageRoleUser),
-				Content: openai.F([]responses.InputContentPartUnionParam{
-					responses.InputContentPartTextParam{Text: openai.F(prompt)},
-				}),
+	resp, err := p.client.Responses.New(ctx, responses.ResponseNewParams{
+		Model: shared.ResponsesModel(p.model),
+		Input: responses.ResponseNewParamsInputUnion{
+			OfInputItemList: responses.ResponseInputParam{
+				responses.ResponseInputItemUnionParam{
+					OfMessage: &responses.EasyInputMessageParam{
+						Role: responses.EasyInputMessageRoleUser,
+						Content: responses.EasyInputMessageContentUnionParam{
+							OfString: openai.String(prompt),
+						},
+					},
+				},
 			},
-		}),
+		},
 	})
 	if err != nil {
 		return "", fmt.Errorf("openai chat: %w", err)
