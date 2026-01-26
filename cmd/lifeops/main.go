@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"lifeops/internal/api"
+	"lifeops/internal/calendar"
 	"lifeops/internal/config"
 	"lifeops/internal/finance"
 	"lifeops/internal/health"
@@ -25,7 +27,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		log.Fatalf("usage: %s [api|bot|worker|worker-once|worker-debug|ingest-finance|seed-sample]", os.Args[0])
+		log.Fatalf("usage: %s [api|bot|worker|worker-once|worker-debug|ingest-finance|seed-sample|calendar-sync|nutrition-logs|nutrition-fix-chat]", os.Args[0])
 	}
 	mode := os.Args[1]
 
@@ -62,6 +64,12 @@ func main() {
 		runIngest(ctx, cfg, store)
 	case "seed-sample":
 		runSeedSample(ctx, cfg, store)
+	case "calendar-sync":
+		runCalendarSync(ctx, cfg, store)
+	case "nutrition-logs":
+		runNutritionLogs(ctx, cfg, store, os.Args[2:])
+	case "nutrition-fix-chat":
+		runNutritionFixChat(ctx, cfg, store, os.Args[2:])
 	default:
 		log.Fatalf("unknown mode %s", mode)
 	}
@@ -108,35 +116,109 @@ func runAPI(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 func runBot(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 	provider := buildProvider(cfg)
 	if len(cfg.TelegramAgents) > 0 {
-		errCh := make(chan error, len(cfg.TelegramAgents))
+		errCh := make(chan error, len(cfg.TelegramAgents)*3+1)
 		started := 0
 		for agentName, agentCfg := range cfg.TelegramAgents {
 			agentCfg := agentCfg
-			token := agentCfg.TelegramToken
-			if token == "" && len(cfg.TelegramBotTokens) > 0 {
-				token = cfg.TelegramBotTokens[agentName]
+			primaryToken := strings.TrimSpace(agentCfg.TelegramToken)
+			if primaryToken == "" && len(cfg.TelegramBotTokens) > 0 {
+				primaryToken = strings.TrimSpace(cfg.TelegramBotTokens[agentName])
 			}
-			if token == "" {
+			type botRole struct {
+				token string
+				isLog bool
+			}
+			tokenRoles := map[string]*botRole{}
+			hasDedicatedLog := false
+			addRole := func(token string, isLog bool) {
+				token = strings.TrimSpace(token)
+				if token == "" {
+					return
+				}
+				if existing, ok := tokenRoles[token]; ok {
+					if isLog {
+						existing.isLog = true
+					}
+					return
+				}
+				tokenRoles[token] = &botRole{token: token, isLog: isLog}
+				if isLog {
+					hasDedicatedLog = true
+				}
+			}
+			addRole(primaryToken, false)
+			addRole(agentCfg.NutritionReviewTelegramToken, false)
+			addRole(agentCfg.NutritionLogTelegramToken, true)
+			if len(tokenRoles) == 0 {
 				log.Printf("telegram bot token missing for agent %s; skipping bot startup", agentName)
 				continue
 			}
-			started++
-			go func(token string, agentCfg config.AgentConfig) {
-				bot, err := tgbotapi.NewBotAPI(token)
-				if err != nil {
-					errCh <- fmt.Errorf("telegram %s: %w", agentCfg.Name, err)
-					return
+			var reviewSender telegram.Sender
+			if strings.EqualFold(agentCfg.Name, "nutrition") {
+				reviewToken := strings.TrimSpace(agentCfg.NutritionReviewTelegramToken)
+				if reviewToken == "" {
+					reviewToken = primaryToken
 				}
-				sender := telegram.NewBotSenderFromBot(bot)
-				handler := telegram.NewHandler(store, provider, sender, bot, telegram.HandlerConfig{
-					Agent:        agentCfg.Name,
-					HistoryLimit: cfg.ChatHistoryLimit,
-					Prompt:       agentCfg.Prompt,
-				})
-				if err := handler.Run(ctx); err != nil && ctx.Err() == nil {
-					errCh <- fmt.Errorf("bot %s: %w", agentCfg.Name, err)
+				if reviewToken == "" {
+					for _, role := range tokenRoles {
+						if !role.isLog {
+							reviewToken = role.token
+							break
+						}
+					}
 				}
-			}(token, agentCfg)
+				if reviewToken == "" {
+					for _, role := range tokenRoles {
+						reviewToken = role.token
+						break
+					}
+				}
+				if reviewToken != "" {
+					sender, err := telegram.NewBotSender(reviewToken)
+					if err != nil {
+						errCh <- fmt.Errorf("telegram %s review sender: %w", agentCfg.Name, err)
+						continue
+					}
+					reviewSender = sender
+				}
+			}
+			for _, role := range tokenRoles {
+				role := role
+				started++
+				go func(role *botRole, agentCfg config.AgentConfig, reviewSender telegram.Sender) {
+					bot, err := tgbotapi.NewBotAPI(role.token)
+					if err != nil {
+						errCh <- fmt.Errorf("telegram %s: %w", agentCfg.Name, err)
+						return
+					}
+					sender := telegram.NewBotSenderFromBot(bot)
+					var followUp func(context.Context, int64) error
+					if strings.EqualFold(agentCfg.Name, "nutrition") {
+						followUpSender := reviewSender
+						if followUpSender == nil {
+							followUpSender = sender
+						}
+						if followUpSender != nil {
+							followUp = func(ctx context.Context, chatID int64) error {
+								w := worker.New(store, provider, followUpSender, agentCfg, cfg.ChatHistoryLimit, agentCfg.DefaultChatIDs)
+								return w.RunForChat(ctx, chatID)
+							}
+						}
+					}
+					handler := telegram.NewHandler(store, provider, sender, bot, telegram.HandlerConfig{
+						Agent:             agentCfg.Name,
+						HistoryLimit:      cfg.ChatHistoryLimit,
+						Prompt:            agentCfg.Prompt,
+						AgentConfig:       &agentCfg,
+						NutritionFollowUp: followUp,
+						IsNutritionLogBot: role.isLog,
+						HasDedicatedLog:   hasDedicatedLog,
+					})
+					if err := handler.Run(ctx); err != nil && ctx.Err() == nil {
+						errCh <- fmt.Errorf("bot %s: %w", agentCfg.Name, err)
+					}
+				}(role, agentCfg, reviewSender)
+			}
 		}
 		if started > 0 {
 			select {
@@ -161,7 +243,6 @@ func runBot(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 		log.Fatalf("bot: %v", err)
 	}
 }
-
 func runWorker(ctx context.Context, cfg *config.Config, store *storepkg.Store, loop bool) {
 	provider := buildProvider(cfg)
 	if len(cfg.TelegramAgents) > 0 {
@@ -169,9 +250,20 @@ func runWorker(ctx context.Context, cfg *config.Config, store *storepkg.Store, l
 		started := 0
 		for name, agent := range cfg.TelegramAgents {
 			agent := agent
-			token := agent.TelegramToken
-			if token == "" && len(cfg.TelegramBotTokens) > 0 {
-				token = cfg.TelegramBotTokens[name]
+			token := strings.TrimSpace(agent.TelegramToken)
+			overrideToken := ""
+			if len(cfg.TelegramBotTokens) > 0 {
+				overrideToken = strings.TrimSpace(cfg.TelegramBotTokens[name])
+			}
+			if token == "" {
+				token = overrideToken
+			}
+			if strings.EqualFold(agent.Name, "nutrition") {
+				if trimmed := strings.TrimSpace(agent.NutritionReviewTelegramToken); trimmed != "" {
+					token = trimmed
+				} else if token == "" && strings.TrimSpace(agent.NutritionLogTelegramToken) != "" {
+					token = strings.TrimSpace(agent.NutritionLogTelegramToken)
+				}
 			}
 			if token == "" {
 				log.Printf("telegram bot token missing for agent %s; skipping daily review", name)
@@ -227,6 +319,7 @@ func runWorker(ctx context.Context, cfg *config.Config, store *storepkg.Store, l
 		DailyReviewPrompt: config.DefaultDailyReviewPrompt,
 		Timezone:          cfg.Timezone,
 		DailyReviewTime:   config.DailyReviewTime{Hour: 9, Minute: 0},
+		DailyReviewTimes:  []config.DailyReviewTime{{Hour: 9, Minute: 0}},
 	}
 	defaultChatIDs := []int64{}
 	if cfg.TelegramChatID != 0 {
@@ -276,6 +369,7 @@ func runWorkerDebug(ctx context.Context, cfg *config.Config, store *storepkg.Sto
 		DailyReviewPrompt: config.DefaultDailyReviewPrompt,
 		Timezone:          cfg.Timezone,
 		DailyReviewTime:   config.DailyReviewTime{Hour: 9, Minute: 0},
+		DailyReviewTimes:  []config.DailyReviewTime{{Hour: 9, Minute: 0}},
 	}
 	if cfg.TelegramChatID != 0 {
 		agent.DefaultChatIDs = []int64{cfg.TelegramChatID}
@@ -300,6 +394,125 @@ func runSeedSample(ctx context.Context, cfg *config.Config, store *storepkg.Stor
 		log.Fatalf("seed finance: %v", err)
 	}
 	log.Printf("Seeded demo data into %s", cfg.PostgresDSN)
+}
+
+func runCalendarSync(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
+	if len(cfg.CalendarSources) == 0 {
+		log.Fatalf("calendar sync: CALENDAR_SOURCES is not configured")
+	}
+	sources := make([]calendar.Source, 0, len(cfg.CalendarSources))
+	for _, src := range cfg.CalendarSources {
+		sources = append(sources, calendar.Source{
+			ID:  src.ID,
+			URL: src.URL,
+		})
+	}
+	syncer := calendar.NewSyncer(store, calendar.Config{
+		Sources:    sources,
+		PastDays:   cfg.CalendarLookbackDays,
+		FutureDays: cfg.CalendarLookaheadDays,
+		Interval:   cfg.CalendarSyncInterval,
+	})
+	if err := syncer.Run(ctx); err != nil && ctx.Err() == nil {
+		log.Fatalf("calendar sync: %v", err)
+	}
+}
+
+func runNutritionLogs(ctx context.Context, cfg *config.Config, store *storepkg.Store, args []string) {
+	fs := flag.NewFlagSet("nutrition-logs", flag.ExitOnError)
+	lookback := fs.Int("days", 2, "Days of nutrition history to include")
+	limit := fs.Int("limit", 20, "Maximum number of entries to show")
+	chatFlag := fs.Int64("chat", 0, "Override chat id (defaults to nutrition log chat)")
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("parse nutrition-logs flags: %v", err)
+	}
+	if *lookback <= 0 {
+		log.Fatalf("days must be > 0")
+	}
+	if *limit <= 0 || *limit > 200 {
+		log.Fatalf("limit must be between 1 and 200")
+	}
+	targetChat := *chatFlag
+	if targetChat == 0 {
+		if agent, ok := cfg.TelegramAgents["nutrition"]; ok {
+			targetChat = agent.NutritionLogChatID
+		}
+	}
+	loc := cfg.Timezone
+	if loc == nil {
+		loc = time.UTC
+	}
+	since := time.Now().In(loc).AddDate(0, 0, -*lookback).UTC()
+	entries, err := store.RecentNutritionEntries(ctx, targetChat, since, *limit)
+	if err != nil {
+		log.Fatalf("load nutrition entries: %v", err)
+	}
+	if len(entries) == 0 {
+		label := "all chats"
+		if targetChat != 0 {
+			label = fmt.Sprintf("chat %d", targetChat)
+		}
+		fmt.Printf("No nutrition entries found for %s in the last %d day(s).\n", label, *lookback)
+		return
+	}
+	fmt.Printf("Found %d nutrition entrie(s) since %s (UTC) for ", len(entries), since.Format(time.RFC3339))
+	if targetChat == 0 {
+		fmt.Print("all nutrition chats.\n")
+	} else {
+		fmt.Printf("chat %d.\n", targetChat)
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		ts := entry.MessageTS.In(loc).Format("2006-01-02 15:04")
+		fmt.Printf("[%s] chat=%d\n", ts, entry.ChatID)
+		fmt.Printf("  summary : %s\n", strings.TrimSpace(entry.Summary))
+		fmt.Printf("  original: %s\n", strings.TrimSpace(entry.OriginalText))
+		var macros []string
+		if entry.Calories != nil {
+			macros = append(macros, fmt.Sprintf("калории %s", formatFloat(*entry.Calories)))
+		}
+		if entry.ProteinGrams != nil {
+			macros = append(macros, fmt.Sprintf("белки %s г", formatFloat(*entry.ProteinGrams)))
+		}
+		if entry.CarbsGrams != nil {
+			macros = append(macros, fmt.Sprintf("углеводы %s г", formatFloat(*entry.CarbsGrams)))
+		}
+		if entry.FatGrams != nil {
+			macros = append(macros, fmt.Sprintf("жиры %s г", formatFloat(*entry.FatGrams)))
+		}
+		if len(macros) > 0 {
+			fmt.Printf("  macros  : %s\n", strings.Join(macros, ", "))
+		}
+		fmt.Println()
+	}
+}
+
+func formatFloat(v float64) string {
+	if v == 0 {
+		return "0"
+	}
+	if v == float64(int64(v)) {
+		return fmt.Sprintf("%.0f", v)
+	}
+	return fmt.Sprintf("%.1f", v)
+}
+
+func runNutritionFixChat(ctx context.Context, cfg *config.Config, store *storepkg.Store, args []string) {
+	_ = cfg
+	fs := flag.NewFlagSet("nutrition-fix-chat", flag.ExitOnError)
+	from := fs.Int64("from", 0, "Existing chat_id to replace (required)")
+	to := fs.Int64("to", 0, "Target chat_id to assign (required)")
+	if err := fs.Parse(args); err != nil {
+		log.Fatalf("parse nutrition-fix-chat flags: %v", err)
+	}
+	if *from <= 0 || *to <= 0 {
+		log.Fatalf("--from and --to must be positive chat ids")
+	}
+	updated, err := store.ReassignNutritionChatID(ctx, *from, *to)
+	if err != nil {
+		log.Fatalf("rewrite chat ids: %v", err)
+	}
+	fmt.Printf("Updated %d nutrition entrie(s) from chat %d to %d.\n", updated, *from, *to)
 }
 
 func seedHealthData(ctx context.Context, store *storepkg.Store) error {

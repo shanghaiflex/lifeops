@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,13 +20,15 @@ type toolRegistry struct {
 	handlers    map[string]toolHandler
 	timezone    *time.Location
 	chatID      int64
+	logChatIDs  []int64
 }
 
-func newToolRegistry(store SummaryStore, timezone *time.Location) *toolRegistry {
+func newToolRegistry(store SummaryStore, timezone *time.Location, nutritionLogChatIDs []int64) *toolRegistry {
 	registry := &toolRegistry{
-		store:    store,
-		handlers: make(map[string]toolHandler),
-		timezone: timezone,
+		store:      store,
+		handlers:   make(map[string]toolHandler),
+		timezone:   timezone,
+		logChatIDs: append([]int64(nil), nutritionLogChatIDs...),
 	}
 	registry.register(llm.ToolDefinition{
 		Name: "retrieve_workouts",
@@ -220,22 +223,80 @@ func newToolRegistry(store SummaryStore, timezone *time.Location) *toolRegistry 
 			},
 		},
 	}, func(ctx context.Context, raw json.RawMessage) (string, error) {
-		if registry.chatID == 0 {
-			return "", fmt.Errorf("retrieve_nutrition_logs: chat context is required")
-		}
 		var args rangeArgs
 		if err := decodeArgs(raw, &args); err != nil {
 			return "", err
 		}
 		args.applyDefaults(3, 20, 30, 50)
 		since := time.Now().In(registry.timezone).AddDate(0, 0, -args.LookbackDays)
-		data, err := registry.store.RecentNutritionEntries(ctx, registry.chatID, since, args.Limit)
+		targets := make([]int64, 0, len(registry.logChatIDs)+1)
+		if registry.chatID != 0 {
+			targets = append(targets, registry.chatID)
+		}
+		targets = append(targets, registry.logChatIDs...)
+		if len(targets) == 0 {
+			return "", fmt.Errorf("retrieve_nutrition_logs: chat context is required")
+		}
+		data, err := registry.loadNutritionEntries(ctx, targets, since, args.Limit)
 		if err != nil {
 			return "", err
 		}
 		payload := map[string]any{
 			"lookback_days": args.LookbackDays,
 			"items":         serializeNutritionEntries(data),
+		}
+		return marshalPayload(payload)
+	})
+
+	registry.register(llm.ToolDefinition{
+		Name:        "retrieve_calendar_events",
+		Description: "Возвращает события из календаря (Яндекс). Используй для планирования дня и учёта встреч.",
+		Parameters: map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []string{"calendar_id", "lookback_days", "lookahead_days", "limit"},
+			"properties": map[string]any{
+				"calendar_id": map[string]any{
+					"type":        "string",
+					"description": "Идентификатор календаря (например, personal).",
+				},
+				"lookback_days": map[string]any{
+					"type":        "integer",
+					"description": "Сколько дней назад включать события (0-30).",
+					"minimum":     0,
+					"maximum":     30,
+				},
+				"lookahead_days": map[string]any{
+					"type":        "integer",
+					"description": "Сколько дней вперёд смотреть (1-60).",
+					"minimum":     1,
+					"maximum":     60,
+				},
+				"limit": map[string]any{
+					"type":        "integer",
+					"description": "Максимум событий (1-100).",
+					"minimum":     1,
+					"maximum":     100,
+				},
+			},
+		},
+	}, func(ctx context.Context, raw json.RawMessage) (string, error) {
+		var args calendarArgs
+		if err := decodeArgs(raw, &args); err != nil {
+			return "", err
+		}
+		args.applyDefaults()
+		windowStart := time.Now().In(registry.timezone).AddDate(0, 0, -args.LookbackDays)
+		windowEnd := time.Now().In(registry.timezone).AddDate(0, 0, args.LookaheadDays)
+		events, err := registry.store.CalendarEventsBetween(ctx, strings.TrimSpace(args.CalendarID), windowStart, windowEnd, args.Limit)
+		if err != nil {
+			return "", err
+		}
+		payload := map[string]any{
+			"calendar_id":  strings.TrimSpace(args.CalendarID),
+			"window_start": windowStart.Format(time.RFC3339),
+			"window_end":   windowEnd.Format(time.RFC3339),
+			"items":        serializeCalendarEvents(events, registry.timezone),
 		}
 		return marshalPayload(payload)
 	})
@@ -303,6 +364,35 @@ func (r *rangeArgs) applyDefaults(defaultLookback, defaultLimit, maxLookback, ma
 type metricArgs struct {
 	rangeArgs
 	Kinds []string `json:"kinds"`
+}
+
+type calendarArgs struct {
+	CalendarID    string `json:"calendar_id"`
+	LookbackDays  int    `json:"lookback_days"`
+	LookaheadDays int    `json:"lookahead_days"`
+	Limit         int    `json:"limit"`
+}
+
+func (c *calendarArgs) applyDefaults() {
+	c.CalendarID = strings.TrimSpace(c.CalendarID)
+	if c.LookbackDays < 0 {
+		c.LookbackDays = 0
+	}
+	if c.LookbackDays > 30 {
+		c.LookbackDays = 30
+	}
+	if c.LookaheadDays <= 0 {
+		c.LookaheadDays = 7
+	}
+	if c.LookaheadDays > 60 {
+		c.LookaheadDays = 60
+	}
+	if c.Limit <= 0 {
+		c.Limit = 20
+	}
+	if c.Limit > 100 {
+		c.Limit = 100
+	}
 }
 
 func decodeArgs(raw json.RawMessage, target interface{}) error {
@@ -380,6 +470,32 @@ func serializeMetrics(metrics []store.Metric) []map[string]any {
 	return out
 }
 
+func (t *toolRegistry) loadNutritionEntries(ctx context.Context, chatIDs []int64, since time.Time, limit int) ([]store.NutritionEntry, error) {
+	if len(chatIDs) == 0 {
+		return nil, nil
+	}
+	unique := make(map[int64]struct{}, len(chatIDs))
+	var combined []store.NutritionEntry
+	for _, id := range chatIDs {
+		if _, ok := unique[id]; ok {
+			continue
+		}
+		unique[id] = struct{}{}
+		data, err := t.store.RecentNutritionEntries(ctx, id, since, limit)
+		if err != nil {
+			return nil, err
+		}
+		combined = append(combined, data...)
+	}
+	sort.Slice(combined, func(i, j int) bool {
+		return combined[i].MessageTS.After(combined[j].MessageTS)
+	})
+	if len(combined) > limit {
+		combined = combined[:limit]
+	}
+	return combined, nil
+}
+
 func serializeNutritionEntries(entries []store.NutritionEntry) []map[string]any {
 	out := make([]map[string]any, 0, len(entries))
 	for _, entry := range entries {
@@ -403,6 +519,38 @@ func serializeNutritionEntries(entries []store.NutritionEntry) []map[string]any 
 		}
 		if strings.TrimSpace(entry.PhotoFileID) != "" {
 			item["photo_file_id"] = entry.PhotoFileID
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func serializeCalendarEvents(events []store.CalendarEvent, loc *time.Location) []map[string]any {
+	out := make([]map[string]any, 0, len(events))
+	if loc == nil {
+		loc = time.UTC
+	}
+	for _, ev := range events {
+		start := ev.Start.In(loc)
+		end := ev.End.In(loc)
+		item := map[string]any{
+			"id":             ev.ID,
+			"calendar_id":    ev.CalendarID,
+			"event_uid":      ev.EventUID,
+			"title":          ev.Title,
+			"start":          start.Format(time.RFC3339),
+			"end":            end.Format(time.RFC3339),
+			"all_day":        ev.AllDay,
+			"duration_hours": end.Sub(start).Hours(),
+		}
+		if strings.TrimSpace(ev.Description) != "" {
+			item["description"] = ev.Description
+		}
+		if strings.TrimSpace(ev.Location) != "" {
+			item["location"] = ev.Location
+		}
+		if ev.SourceUpdatedAt != nil {
+			item["source_updated_at"] = ev.SourceUpdatedAt.In(loc).Format(time.RFC3339)
 		}
 		out = append(out, item)
 	}
