@@ -62,6 +62,106 @@ type Metric struct {
 	Raw   json.RawMessage
 }
 
+type NutritionEntry struct {
+	ID           int64
+	ChatID       int64
+	MessageTS    time.Time
+	OriginalText string
+	Summary      string
+	Calories     *float64
+	ProteinGrams *float64
+	CarbsGrams   *float64
+	FatGrams     *float64
+	PhotoFileID  string
+	Raw          json.RawMessage
+	CreatedAt    time.Time
+}
+
+func (s *Store) InsertNutritionEntry(ctx context.Context, entry NutritionEntry) (int64, error) {
+	if entry.Raw == nil {
+		entry.Raw = json.RawMessage(`{}`)
+	}
+	var id int64
+	var created time.Time
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO nutrition_entries
+			(chat_id, message_ts, original_text, summary, calories, protein_g, carbs_g, fat_g, photo_file_id, raw_payload)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		RETURNING id, created_at
+	`, entry.ChatID, entry.MessageTS, entry.OriginalText, entry.Summary, entry.Calories, entry.ProteinGrams, entry.CarbsGrams, entry.FatGrams, nullIfEmpty(entry.PhotoFileID), entry.Raw).Scan(&id, &created)
+	if err != nil {
+		return 0, fmt.Errorf("insert nutrition entry: %w", err)
+	}
+	entry.ID = id
+	entry.CreatedAt = created
+	return id, nil
+}
+
+func (s *Store) RecentNutritionEntries(ctx context.Context, chatID int64, since time.Time, limit int) ([]NutritionEntry, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, chat_id, message_ts, original_text, summary, calories, protein_g, carbs_g, fat_g, photo_file_id, raw_payload, created_at
+		FROM nutrition_entries
+		WHERE message_ts >= $1 AND ($2 = 0 OR chat_id = $2)
+		ORDER BY message_ts DESC
+		LIMIT $3
+	`, since, chatID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent nutrition entries: %w", err)
+	}
+	defer rows.Close()
+	var out []NutritionEntry
+	for rows.Next() {
+		var (
+			calories sql.NullFloat64
+			protein  sql.NullFloat64
+			carbs    sql.NullFloat64
+			fat      sql.NullFloat64
+			photo    sql.NullString
+			raw      []byte
+			entry    NutritionEntry
+		)
+		if err := rows.Scan(
+			&entry.ID,
+			&entry.ChatID,
+			&entry.MessageTS,
+			&entry.OriginalText,
+			&entry.Summary,
+			&calories,
+			&protein,
+			&carbs,
+			&fat,
+			&photo,
+			&raw,
+			&entry.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("recent nutrition scan: %w", err)
+		}
+		if calories.Valid {
+			entry.Calories = &calories.Float64
+		}
+		if protein.Valid {
+			entry.ProteinGrams = &protein.Float64
+		}
+		if carbs.Valid {
+			entry.CarbsGrams = &carbs.Float64
+		}
+		if fat.Valid {
+			entry.FatGrams = &fat.Float64
+		}
+		if photo.Valid {
+			entry.PhotoFileID = photo.String
+		}
+		if len(raw) > 0 {
+			entry.Raw = json.RawMessage(raw)
+		}
+		out = append(out, entry)
+	}
+	return out, rows.Err()
+}
+
 type UpsertStats struct {
 	Inserted int
 	Updated  int
@@ -561,4 +661,11 @@ func (s *Store) ChatIDsForAgent(ctx context.Context, agent string) ([]int64, err
 type ChatMessage struct {
 	Role    string
 	Content string
+}
+
+func nullIfEmpty(value string) interface{} {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	return value
 }

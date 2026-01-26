@@ -219,10 +219,12 @@ func (m *MockProvider) GenerateJSON(_ context.Context, _ string) (string, error)
 	if m.JSONResponse != "" {
 		return m.JSONResponse, nil
 	}
-	payload := map[string]string{
-		"coach":   "Mock coach summary",
-		"sleep":   "Mock sleep summary",
-		"finance": "Mock finance summary",
+	payload := map[string]any{
+		"summary":   "Mock meal entry",
+		"calories":  600,
+		"protein_g": 30,
+		"carbs_g":   50,
+		"fat_g":     20,
 	}
 	data, _ := json.Marshal(payload)
 	return string(data), nil

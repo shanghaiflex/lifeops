@@ -1,6 +1,6 @@
 name: coach
-telegram_token: 8144284110:AAHipKoOAmtHSeEO-fIGCcryk_uxvOPgUYc
-chat_id: 182466300
+telegram_token: ${COACH_TELEGRAM_TOKEN}
+chat_id: ${COACH_TELEGRAM_CHAT_ID}
 prompt: |
   Ты - мой спортивный тренер. Меня зовут Сергей, мне 31, рост 187см, изначальный вес - 81кг. 
   Я тренируюсь иногда в зале с железом, иногда плаваю, иногда катаюсь на лыжах и играю в теннис.

@@ -7,6 +7,7 @@ Local MVP backend for personal life analytics (Health Bridge ingest + finance CS
 - CSV finance ingestion from `./data/finance`.
 - Daily Telegram digest via LLM provider (OpenAI or mock).
 - Telegram bots per agent with separate chat history/context.
+- Nutritionist Telegram bot that logs every meal (text + optional photo), stores calories/macрос in Postgres, and exposes the data as a tool for other agents (e.g. the coach).
 
 ## Requirements
 - Docker + Docker Compose
@@ -85,7 +86,7 @@ Commands (single bot mode):
 - `/start`
 - `/whoami`
 - `/daily`
-- `/coach` / `/sleep` / `/finance`
+- `/coach` / `/sleep` / `/finance` / `/nutrition`
 
 Commands (multi-bot mode):
 - `/start`
@@ -115,6 +116,7 @@ Each YAML file supports:
 - `timezone`: IANA timezone name for the daily review schedule (defaults to `Europe/Moscow`).
 - `daily_review_time`: time of day (`HH:MM`) for the daily review.
 - `daily_review_prompt`: prompt text for the daily review. The worker automatically appends instructions describing every available tool, so keep this field focused on tone/style.
+- `telegram_token` / `chat_id`: you can point these to environment variables using `${ENV_VAR_NAME}` or `env:ENV_VAR_NAME` so actual secrets stay in your `.env`. Example: `telegram_token: ${COACH_TELEGRAM_TOKEN}`. All env values are resolved automatically when configs are loaded.
 
 Example:
 

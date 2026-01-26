@@ -1,2 +1,3 @@
 .env
-data/telegram_agents/
+data/telegram_agents/*.local.yaml
+data/telegram_agents/*.secret.yaml
