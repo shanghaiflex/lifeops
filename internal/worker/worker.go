@@ -2,40 +2,59 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
+	"strings"
 	"time"
 
+	"lifeops/internal/config"
 	"lifeops/internal/llm"
+	"lifeops/internal/store"
 	"lifeops/internal/telegram"
 )
-
-type DailyReport struct {
-	Coach string `json:"coach"`
-	Sleep string `json:"sleep"`
-}
 
 type SummaryStore interface {
 	RecentHealthSummary(ctx context.Context, since time.Time) (string, error)
 	MetricsSummary(ctx context.Context, since time.Time) (string, error)
 	RecentFinanceSummary(ctx context.Context, since time.Time) (string, error)
+	ChatHistory(ctx context.Context, chatID int64, agent string, limit int) ([]store.ChatMessage, error)
+	SaveChatMessage(ctx context.Context, chatID int64, agent string, role string, content string) error
+	ChatIDsForAgent(ctx context.Context, agent string) ([]int64, error)
 }
 
 type Worker struct {
-	store    SummaryStore
-	provider llm.Provider
-	sender   telegram.Sender
-	timezone *time.Location
-	chatID   int64
+	store          SummaryStore
+	provider       llm.Provider
+	sender         telegram.Sender
+	agent          config.AgentConfig
+	historyLimit   int
+	defaultChatIDs []int64
 }
 
-func New(store SummaryStore, provider llm.Provider, sender telegram.Sender, timezone *time.Location, chatID int64) *Worker {
-	return &Worker{store: store, provider: provider, sender: sender, timezone: timezone, chatID: chatID}
+func New(store SummaryStore, provider llm.Provider, sender telegram.Sender, agent config.AgentConfig, historyLimit int, defaultChatIDs []int64) *Worker {
+	if agent.DailyReviewPrompt == "" {
+		agent.DailyReviewPrompt = config.DefaultDailyReviewPrompt
+	}
+	if agent.Timezone == nil {
+		agent.Timezone = time.UTC
+	}
+	if agent.DailyReviewTime.Hour == 0 && agent.DailyReviewTime.Minute == 0 {
+		agent.DailyReviewTime = config.DailyReviewTime{Hour: 9, Minute: 0}
+	}
+	return &Worker{
+		store:          store,
+		provider:       provider,
+		sender:         sender,
+		agent:          agent,
+		historyLimit:   historyLimit,
+		defaultChatIDs: defaultChatIDs,
+	}
 }
 
 func (w *Worker) RunDaily(ctx context.Context) error {
-	now := time.Now().In(w.timezone)
-	next := time.Date(now.Year(), now.Month(), now.Day(), 9, 0, 0, 0, w.timezone).Add(24 * time.Hour)
+	now := time.Now().In(w.agent.Timezone)
+	next := time.Date(now.Year(), now.Month(), now.Day(), w.agent.DailyReviewTime.Hour, w.agent.DailyReviewTime.Minute, 0, 0, w.agent.Timezone)
+	if !next.After(now) {
+		next = next.Add(24 * time.Hour)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -50,7 +69,7 @@ func (w *Worker) RunDaily(ctx context.Context) error {
 }
 
 func (w *Worker) RunOnce(ctx context.Context) error {
-	since := time.Now().In(w.timezone).AddDate(0, 0, -7)
+	since := time.Now().In(w.agent.Timezone).AddDate(0, 0, -7)
 
 	healthSummary, err := w.store.RecentHealthSummary(ctx, since)
 	if err != nil {
@@ -60,55 +79,49 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	prompt := fmt.Sprintf(`Ты дружелюбный ассистент и общаешься на русском в свободной форме.
-Составь короткий неформальный дайджест в формате JSON.
-Верни объект с ключами "coach" и "sleep".
-- "coach" описывает тренировки и активность.
-- "sleep" описывает сон и восстановление.
-Используй данные ниже:
-Заметки по тренировкам: %s
-Заметки по метрикам: %s`, healthSummary, metricsSummary)
-	jsonPayload, err := w.provider.GenerateJSON(ctx, prompt)
+	financeSummary, err := w.store.RecentFinanceSummary(ctx, since)
 	if err != nil {
 		return err
 	}
-	report, err := parseDailyReport(jsonPayload)
+	chatIDs, err := w.store.ChatIDsForAgent(ctx, w.agent.Name)
 	if err != nil {
 		return err
 	}
-	if w.chatID == 0 {
+	if len(chatIDs) == 0 && len(w.defaultChatIDs) > 0 {
+		chatIDs = w.defaultChatIDs
+	}
+	if len(chatIDs) == 0 {
 		return nil
 	}
-	message := FormatTelegramMessage(report)
-	return w.sender.SendMessage(ctx, w.chatID, message)
-}
-
-func FormatTelegramMessage(report DailyReport) string {
-	return fmt.Sprintf("Ежедневный отчёт\n\n🏋️ Тренер\n%s\n\n😴 Сон и восстановление\n%s", report.Coach, report.Sleep)
-}
-
-func parseDailyReport(payload string) (DailyReport, error) {
-	var raw map[string]interface{}
-	if err := json.Unmarshal([]byte(payload), &raw); err != nil {
-		return DailyReport{}, fmt.Errorf("parse report json: %w", err)
-	}
-	report := DailyReport{
-		Coach: normalizeReportField(raw["coach"]),
-		Sleep: normalizeReportField(raw["sleep"]),
-	}
-	return report, nil
-}
-
-func normalizeReportField(value interface{}) string {
-	switch v := value.(type) {
-	case string:
-		return v
-	case nil:
-		return ""
-	default:
-		if b, err := json.Marshal(v); err == nil {
-			return string(b)
+	dailyPrompt := renderDailyReviewPrompt(w.agent.DailyReviewPrompt, healthSummary, metricsSummary, financeSummary)
+	systemPrompt := telegram.ResolvePrompt(w.agent.Name, w.agent.Prompt)
+	for _, chatID := range chatIDs {
+		history, err := w.store.ChatHistory(ctx, chatID, w.agent.Name, w.historyLimit)
+		if err != nil {
+			return err
 		}
-		return fmt.Sprint(v)
+		if err := w.store.SaveChatMessage(ctx, chatID, w.agent.Name, "user", dailyPrompt); err != nil {
+			return err
+		}
+		response, err := w.provider.Chat(ctx, telegram.BuildChatPrompt(systemPrompt, dailyPrompt, history))
+		if err != nil {
+			return err
+		}
+		if err := w.store.SaveChatMessage(ctx, chatID, w.agent.Name, "assistant", response); err != nil {
+			return err
+		}
+		if err := w.sender.SendMessage(ctx, chatID, response); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func renderDailyReviewPrompt(template, healthSummary, metricsSummary, financeSummary string) string {
+	replacer := strings.NewReplacer(
+		"{health_summary}", healthSummary,
+		"{metrics_summary}", metricsSummary,
+		"{finance_summary}", financeSummary,
+	)
+	return strings.TrimSpace(replacer.Replace(template))
 }

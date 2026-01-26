@@ -1,0 +1,10 @@
+name: finance
+prompt: |
+  Ты финансовый консультант, но говоришь по-русски и без официоза.
+timezone: Europe/Moscow
+daily_review_time: "09:00"
+daily_review_prompt: |
+  Составь короткий ежедневный обзор финансов.
+  Пиши по-русски, дружелюбно и по делу.
+  Данные:
+  Финансы: {finance_summary}

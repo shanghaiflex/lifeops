@@ -94,13 +94,56 @@ func runAPI(ctx context.Context, cfg *config.Config, store *store.Store) {
 }
 
 func runBot(ctx context.Context, cfg *config.Config, store *store.Store) {
+	provider := buildProvider(cfg)
+	if len(cfg.TelegramAgents) > 0 && len(cfg.TelegramBotTokens) > 0 {
+		errCh := make(chan error, len(cfg.TelegramBotTokens))
+		started := 0
+		for agent, token := range cfg.TelegramBotTokens {
+			agent := agent
+			token := token
+			agentCfg, ok := cfg.TelegramAgents[agent]
+			if !ok {
+				log.Printf("telegram bot token provided for %s but no agent config found", agent)
+				continue
+			}
+			started++
+			go func() {
+				bot, err := tgbotapi.NewBotAPI(token)
+				if err != nil {
+					errCh <- fmt.Errorf("telegram %s: %w", agent, err)
+					return
+				}
+				sender := telegram.NewBotSenderFromBot(bot)
+				handler := telegram.NewHandler(store, provider, sender, bot, telegram.HandlerConfig{
+					Agent:        agent,
+					HistoryLimit: cfg.ChatHistoryLimit,
+					Prompt:       agentCfg.Prompt,
+				})
+				if err := handler.Run(ctx); err != nil && ctx.Err() == nil {
+					errCh <- fmt.Errorf("bot %s: %w", agent, err)
+				}
+			}()
+		}
+		if started == 0 {
+			log.Printf("telegram bot tokens provided but no matching agent configs; skipping bot startup")
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-errCh:
+			log.Fatalf("bot: %v", err)
+		}
+		return
+	}
 	bot, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
 	if err != nil {
 		log.Fatalf("telegram: %v", err)
 	}
-	provider := buildProvider(cfg)
 	sender := telegram.NewBotSenderFromBot(bot)
-	handler := telegram.NewHandler(store, provider, sender, bot)
+	handler := telegram.NewHandler(store, provider, sender, bot, telegram.HandlerConfig{
+		HistoryLimit: cfg.ChatHistoryLimit,
+	})
 	if err := handler.Run(ctx); err != nil && ctx.Err() == nil {
 		log.Fatalf("bot: %v", err)
 	}
@@ -108,6 +151,51 @@ func runBot(ctx context.Context, cfg *config.Config, store *store.Store) {
 
 func runWorker(ctx context.Context, cfg *config.Config, store *store.Store, loop bool) {
 	provider := buildProvider(cfg)
+	if len(cfg.TelegramAgents) > 0 && len(cfg.TelegramBotTokens) > 0 {
+		errCh := make(chan error, len(cfg.TelegramAgents))
+		started := 0
+		for name, agent := range cfg.TelegramAgents {
+			token, ok := cfg.TelegramBotTokens[name]
+			if !ok {
+				log.Printf("telegram bot token missing for agent %s; skipping daily review", name)
+				continue
+			}
+			sender, err := telegram.NewBotSender(token)
+			if err != nil {
+				log.Fatalf("telegram sender: %v", err)
+			}
+			w := worker.New(store, provider, sender, agent, cfg.ChatHistoryLimit, nil)
+			started++
+			go func() {
+				if loop {
+					if err := w.RunDaily(ctx); err != nil && ctx.Err() == nil {
+						errCh <- err
+					}
+					return
+				}
+				errCh <- w.RunOnce(ctx)
+			}()
+		}
+		if started == 0 {
+			log.Printf("no agent workers started for daily review")
+			return
+		}
+		if loop {
+			select {
+			case <-ctx.Done():
+				return
+			case err := <-errCh:
+				log.Fatalf("worker: %v", err)
+			}
+		} else {
+			for i := 0; i < started; i++ {
+				if err := <-errCh; err != nil {
+					log.Fatalf("worker once: %v", err)
+				}
+			}
+		}
+		return
+	}
 	var sender telegram.Sender = &telegram.NoopSender{}
 	if cfg.TelegramToken != "" {
 		realSender, err := telegram.NewBotSender(cfg.TelegramToken)
@@ -116,7 +204,18 @@ func runWorker(ctx context.Context, cfg *config.Config, store *store.Store, loop
 		}
 		sender = realSender
 	}
-	w := worker.New(store, provider, sender, cfg.Timezone, cfg.TelegramChatID)
+	agent := config.AgentConfig{
+		Name:              "coach",
+		Prompt:            "",
+		DailyReviewPrompt: config.DefaultDailyReviewPrompt,
+		Timezone:          cfg.Timezone,
+		DailyReviewTime:   config.DailyReviewTime{Hour: 9, Minute: 0},
+	}
+	defaultChatIDs := []int64{}
+	if cfg.TelegramChatID != 0 {
+		defaultChatIDs = []int64{cfg.TelegramChatID}
+	}
+	w := worker.New(store, provider, sender, agent, cfg.ChatHistoryLimit, defaultChatIDs)
 	if loop {
 		if err := w.RunDaily(ctx); err != nil && ctx.Err() == nil {
 			log.Fatalf("worker: %v", err)

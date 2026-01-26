@@ -6,7 +6,7 @@ Local MVP backend for personal life analytics (Health Bridge ingest + finance CS
 - LAN-only OpenAPI ingest endpoints for workouts, sleep, and metrics.
 - CSV finance ingestion from `./data/finance`.
 - Daily Telegram digest via LLM provider (OpenAI or mock).
-- Telegram bot with modes `/coach`, `/sleep`, `/finance` and chat history.
+- Telegram bots per agent with separate chat history/context.
 
 ## Requirements
 - Docker + Docker Compose
@@ -24,6 +24,8 @@ cp .env.example .env
 Minimum variables:
 - `POSTGRES_DSN` (leave the host as `postgres` so containers can reach it)
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (optional unless you need Telegram features)
+- `TELEGRAM_BOT_TOKENS` (optional for multi-bot setup)
+- `TELEGRAM_AGENT_CONFIG_DIR` (optional, defaults to `./data/telegram_agents`)
 - `LLM_PROVIDER=mock|openai`
 - `OPENAI_API_KEY` (required if `LLM_PROVIDER=openai`)
 - `OPENAI_MODEL` (default `gpt-5-mini`)
@@ -68,11 +70,16 @@ Run via Docker Compose (`bot` service) or locally:
 go run ./cmd/lifeops bot
 ```
 
-Commands:
+Commands (single bot mode):
 - `/start`
 - `/whoami`
 - `/daily`
 - `/coach` / `/sleep` / `/finance`
+
+Commands (multi-bot mode):
+- `/start`
+- `/whoami`
+- `/daily`
 
 ### Getting Telegram credentials
 1. Open Telegram and start a chat with [@BotFather](https://t.me/BotFather). Send `/newbot` and follow the prompts to name your bot. BotFather will return the `TELEGRAM_BOT_TOKEN`; drop it into `.env`.
@@ -82,6 +89,37 @@ Commands:
    ```
    Look for `"chat":{"id":123456789,...}` in the response and copy the numeric value into `TELEGRAM_CHAT_ID`.
 3. Restart the compose stack (`make up`) so the `bot` and `worker` services pick up the credentials.
+
+### Multi-bot setup (one bot per agent)
+Set `TELEGRAM_BOT_TOKENS` as a comma-separated list of `agent=token` pairs, for example:
+
+```bash
+TELEGRAM_BOT_TOKENS=coach=123:sometoken,sleep=456:othertoken,finance=789:anothertoken
+```
+
+Each agent gets its own bot and its own chat history/context, and daily reviews are generated using that same chat history. To add a new bot, add another `agent=token` pair, then create a YAML config file in `./data/telegram_agents/<agent>.yaml` (or point `TELEGRAM_AGENT_CONFIG_DIR` to your custom folder).
+
+Each YAML file supports:
+- `prompt`: the system prompt for chat.
+- `timezone`: IANA timezone name for the daily review schedule (defaults to `Europe/Moscow`).
+- `daily_review_time`: time of day (`HH:MM`) for the daily review.
+- `daily_review_prompt`: prompt template for the daily review (supports `{health_summary}`, `{metrics_summary}`, `{finance_summary}`).
+
+Example:
+
+```bash
+cat <<'EOF' > ./data/telegram_agents/focus.yaml
+name: focus
+prompt: |
+  Ты ассистент по продуктивности.
+timezone: Europe/Moscow
+daily_review_time: "09:00"
+daily_review_prompt: |
+  Составь краткий обзор продуктивности за день.
+  Тренировки: {health_summary}
+  Метрики: {metrics_summary}
+EOF
+```
 
 ## OpenAI provider
 Set:
