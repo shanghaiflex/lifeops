@@ -1,0 +1,177 @@
+openapi: 3.0.3
+info:
+  title: Health Bridge Ingest API
+  version: 1.0.0
+  description: |
+    Local LAN ingest API for Health Bridge iOS app. All endpoints accept JSON
+    payloads with HealthKit UUIDs for idempotency. Auth is disabled for MVP.
+servers:
+  - url: http://{host}:{port}
+    variables:
+      host:
+        default: 192.168.1.149
+      port:
+        default: "8080"
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+  /v1/ingest/health/workouts:
+    post:
+      summary: Ingest workout samples
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkoutsBatch"
+      responses:
+        "200":
+          description: OK
+  /v1/ingest/health/sleep:
+    post:
+      summary: Ingest sleep samples
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SleepBatch"
+      responses:
+        "200":
+          description: OK
+  /v1/ingest/health/metrics:
+    post:
+      summary: Ingest metric samples
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MetricsBatch"
+      responses:
+        "200":
+          description: OK
+components:
+  schemas:
+    Deletion:
+      type: object
+      required: [id, sampleType]
+      properties:
+        id:
+          type: string
+          description: HealthKit UUID
+        sampleType:
+          type: string
+          description: Sample type identifier
+    Workout:
+      type: object
+      required: [id, workoutType, start, end, durationMinutes]
+      properties:
+        id:
+          type: string
+        workoutType:
+          type: string
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        durationMinutes:
+          type: number
+        distanceMeters:
+          type: number
+          nullable: true
+        calories:
+          type: number
+          nullable: true
+        averageHeartRate:
+          type: number
+          nullable: true
+    SleepBreakdown:
+      type: object
+      required: [remMinutes, deepMinutes, coreMinutes, awakeMinutes]
+      properties:
+        remMinutes:
+          type: number
+        deepMinutes:
+          type: number
+        coreMinutes:
+          type: number
+        awakeMinutes:
+          type: number
+    Sleep:
+      type: object
+      required: [id, start, end, totalMinutes, breakdown]
+      properties:
+        id:
+          type: string
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        totalMinutes:
+          type: number
+        breakdown:
+          $ref: "#/components/schemas/SleepBreakdown"
+    Metric:
+      type: object
+      required: [id, kind, start, end, value, unit]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [hrv_sdnn, resting_heart_rate, steps, active_energy]
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        value:
+          type: number
+        unit:
+          type: string
+    WorkoutsBatch:
+      type: object
+      required: [items, deleted]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Workout"
+        deleted:
+          type: array
+          items:
+            $ref: "#/components/schemas/Deletion"
+    SleepBatch:
+      type: object
+      required: [items, deleted]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Sleep"
+        deleted:
+          type: array
+          items:
+            $ref: "#/components/schemas/Deletion"
+    MetricsBatch:
+      type: object
+      required: [items, deleted]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Metric"
+        deleted:
+          type: array
+          items:
+            $ref: "#/components/schemas/Deletion"
