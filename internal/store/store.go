@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -60,9 +62,15 @@ type Metric struct {
 	Raw   json.RawMessage
 }
 
-func (s *Store) UpsertWorkouts(ctx context.Context, workouts []Workout) error {
+type UpsertStats struct {
+	Inserted int
+	Updated  int
+}
+
+func (s *Store) UpsertWorkouts(ctx context.Context, workouts []Workout) (UpsertStats, error) {
+	var stats UpsertStats
 	if len(workouts) == 0 {
-		return nil
+		return stats, nil
 	}
 	batch := &pgx.Batch{}
 	for _, w := range workouts {
@@ -80,21 +88,29 @@ func (s *Store) UpsertWorkouts(ctx context.Context, workouts []Workout) error {
 				average_heart_rate = EXCLUDED.average_heart_rate,
 				raw_payload = EXCLUDED.raw_payload,
 				deleted_at = NULL
+			RETURNING (xmax = 0) AS inserted
 		`, w.ID, w.WorkoutType, w.Start, w.End, w.DurationMinutes, w.DistanceMeters, w.Calories, w.AverageHeartRate, w.Raw)
 	}
 	br := s.pool.SendBatch(ctx, batch)
 	defer br.Close()
 	for range workouts {
-		if _, err := br.Exec(); err != nil {
-			return fmt.Errorf("upsert workouts: %w", err)
+		var inserted bool
+		if err := br.QueryRow().Scan(&inserted); err != nil {
+			return stats, fmt.Errorf("upsert workouts: %w", err)
+		}
+		if inserted {
+			stats.Inserted++
+		} else {
+			stats.Updated++
 		}
 	}
-	return nil
+	return stats, nil
 }
 
-func (s *Store) UpsertSleep(ctx context.Context, sleeps []Sleep) error {
+func (s *Store) UpsertSleep(ctx context.Context, sleeps []Sleep) (UpsertStats, error) {
+	var stats UpsertStats
 	if len(sleeps) == 0 {
-		return nil
+		return stats, nil
 	}
 	batch := &pgx.Batch{}
 	for _, sl := range sleeps {
@@ -112,21 +128,29 @@ func (s *Store) UpsertSleep(ctx context.Context, sleeps []Sleep) error {
 				awake_minutes = EXCLUDED.awake_minutes,
 				raw_payload = EXCLUDED.raw_payload,
 				deleted_at = NULL
+			RETURNING (xmax = 0) AS inserted
 		`, sl.ID, sl.Start, sl.End, sl.TotalMinutes, sl.RemMinutes, sl.DeepMinutes, sl.CoreMinutes, sl.AwakeMinutes, sl.Raw)
 	}
 	br := s.pool.SendBatch(ctx, batch)
 	defer br.Close()
 	for range sleeps {
-		if _, err := br.Exec(); err != nil {
-			return fmt.Errorf("upsert sleep: %w", err)
+		var inserted bool
+		if err := br.QueryRow().Scan(&inserted); err != nil {
+			return stats, fmt.Errorf("upsert sleep: %w", err)
+		}
+		if inserted {
+			stats.Inserted++
+		} else {
+			stats.Updated++
 		}
 	}
-	return nil
+	return stats, nil
 }
 
-func (s *Store) UpsertMetrics(ctx context.Context, metrics []Metric) error {
+func (s *Store) UpsertMetrics(ctx context.Context, metrics []Metric) (UpsertStats, error) {
+	var stats UpsertStats
 	if len(metrics) == 0 {
-		return nil
+		return stats, nil
 	}
 	batch := &pgx.Batch{}
 	for _, m := range metrics {
@@ -142,39 +166,173 @@ func (s *Store) UpsertMetrics(ctx context.Context, metrics []Metric) error {
 				unit = EXCLUDED.unit,
 				raw_payload = EXCLUDED.raw_payload,
 				deleted_at = NULL
+			RETURNING (xmax = 0) AS inserted
 		`, m.ID, m.Kind, m.Start, m.End, m.Value, m.Unit, m.Raw)
 	}
 	br := s.pool.SendBatch(ctx, batch)
 	defer br.Close()
 	for range metrics {
-		if _, err := br.Exec(); err != nil {
-			return fmt.Errorf("upsert metrics: %w", err)
+		var inserted bool
+		if err := br.QueryRow().Scan(&inserted); err != nil {
+			return stats, fmt.Errorf("upsert metrics: %w", err)
+		}
+		if inserted {
+			stats.Inserted++
+		} else {
+			stats.Updated++
 		}
 	}
-	return nil
+	return stats, nil
+}
+
+func (s *Store) RecentWorkouts(ctx context.Context, since time.Time, limit int) ([]Workout, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, workout_type, start_ts, end_ts, duration_minutes, distance_meters, calories, average_heart_rate, raw_payload
+		FROM health_workouts
+		WHERE start_ts >= $1 AND deleted_at IS NULL
+		ORDER BY start_ts DESC
+		LIMIT $2
+	`, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent workouts: %w", err)
+	}
+	defer rows.Close()
+	var out []Workout
+	for rows.Next() {
+		var (
+			distance sql.NullFloat64
+			calories sql.NullFloat64
+			heart    sql.NullFloat64
+			raw      []byte
+			w        Workout
+		)
+		if err := rows.Scan(&w.ID, &w.WorkoutType, &w.Start, &w.End, &w.DurationMinutes, &distance, &calories, &heart, &raw); err != nil {
+			return nil, fmt.Errorf("recent workouts scan: %w", err)
+		}
+		if distance.Valid {
+			w.DistanceMeters = &distance.Float64
+		}
+		if calories.Valid {
+			w.Calories = &calories.Float64
+		}
+		if heart.Valid {
+			w.AverageHeartRate = &heart.Float64
+		}
+		if len(raw) > 0 {
+			w.Raw = json.RawMessage(raw)
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) RecentSleep(ctx context.Context, since time.Time, limit int) ([]Sleep, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, start_ts, end_ts, total_minutes, rem_minutes, deep_minutes, core_minutes, awake_minutes, raw_payload
+		FROM health_sleep
+		WHERE start_ts >= $1 AND deleted_at IS NULL
+		ORDER BY start_ts DESC
+		LIMIT $2
+	`, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent sleep: %w", err)
+	}
+	defer rows.Close()
+	var out []Sleep
+	for rows.Next() {
+		var (
+			raw []byte
+			sl  Sleep
+		)
+		if err := rows.Scan(&sl.ID, &sl.Start, &sl.End, &sl.TotalMinutes, &sl.RemMinutes, &sl.DeepMinutes, &sl.CoreMinutes, &sl.AwakeMinutes, &raw); err != nil {
+			return nil, fmt.Errorf("recent sleep scan: %w", err)
+		}
+		if len(raw) > 0 {
+			sl.Raw = json.RawMessage(raw)
+		}
+		out = append(out, sl)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) RecentMetrics(ctx context.Context, since time.Time, limit int, kinds []string) ([]Metric, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	query := `
+		SELECT id, kind, start_ts, end_ts, value, unit, raw_payload
+		FROM health_metrics
+		WHERE start_ts >= $1 AND deleted_at IS NULL
+	`
+	args := []any{since}
+	argPos := 2
+	if len(kinds) > 0 {
+		query += fmt.Sprintf(" AND kind = ANY($%d)", argPos)
+		args = append(args, kinds)
+		argPos++
+	}
+	query += fmt.Sprintf(" ORDER BY start_ts DESC LIMIT $%d", argPos)
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("recent metrics: %w", err)
+	}
+	defer rows.Close()
+	var out []Metric
+	for rows.Next() {
+		var (
+			raw []byte
+			m   Metric
+		)
+		if err := rows.Scan(&m.ID, &m.Kind, &m.Start, &m.End, &m.Value, &m.Unit, &raw); err != nil {
+			return nil, fmt.Errorf("recent metrics scan: %w", err)
+		}
+		if len(raw) > 0 {
+			m.Raw = json.RawMessage(raw)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) SoftDelete(ctx context.Context, sampleType string, ids []string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	var table string
-	switch sampleType {
-	case "workout", "workouts":
-		table = "health_workouts"
-	case "sleep":
-		table = "health_sleep"
-	case "metric", "metrics":
-		table = "health_metrics"
-	default:
-		return fmt.Errorf("unknown sampleType %q", sampleType)
+	table, err := mapSampleTypeToTable(sampleType)
+	if err != nil {
+		return err
 	}
 	query := fmt.Sprintf("UPDATE %s SET deleted_at = NOW() WHERE id = ANY($1)", table)
-	_, err := s.pool.Exec(ctx, query, ids)
+	_, err = s.pool.Exec(ctx, query, ids)
 	if err != nil {
 		return fmt.Errorf("soft delete %s: %w", table, err)
 	}
 	return nil
+}
+
+func mapSampleTypeToTable(sampleType string) (string, error) {
+	normalized := strings.ToLower(strings.TrimSpace(sampleType))
+	if normalized == "" {
+		return "", fmt.Errorf("sampleType is required for deletion")
+	}
+	switch normalized {
+	case "workout", "workouts":
+		return "health_workouts", nil
+	case "sleep":
+		return "health_sleep", nil
+	case "metric", "metrics":
+		return "health_metrics", nil
+	default:
+		// Treat metrics kinds (resting_heart_rate, hrv_sdnn, steps, active_energy, etc.) as metrics.
+		return "health_metrics", nil
+	}
 }
 
 type FinanceRaw struct {

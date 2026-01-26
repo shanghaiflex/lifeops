@@ -131,34 +131,43 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) erro
 		return err
 	}
 	systemPrompt := ResolvePrompt(agent, h.prompt)
-	response, err := h.provider.Chat(ctx, BuildChatPrompt(systemPrompt, text, history))
+	messages := buildConversation(systemPrompt, history, text)
+	resp, err := h.provider.Chat(ctx, llm.ChatRequest{
+		Messages: messages,
+	})
 	if err != nil {
 		return err
 	}
-	if err := h.store.SaveChatMessage(ctx, chatID, agent, "assistant", response); err != nil {
+	if resp.Content == "" {
+		return fmt.Errorf("llm returned empty response")
+	}
+	if err := h.store.SaveChatMessage(ctx, chatID, agent, "assistant", resp.Content); err != nil {
 		return err
 	}
-	return h.sender.SendMessage(ctx, chatID, response)
+	return h.sender.SendMessage(ctx, chatID, resp.Content)
 }
 
-func BuildChatPrompt(systemPrompt string, userMessage string, history []store.ChatMessage) string {
-	var builder strings.Builder
-	builder.WriteString(systemPrompt)
-	builder.WriteString("\n\n")
-	for i := len(history) - 1; i >= 0; i-- {
-		roleLabel := "User"
-		switch history[i].Role {
-		case "assistant":
-			roleLabel = "Assistant"
-		case "system":
-			roleLabel = "System"
-		}
-		builder.WriteString(roleLabel)
-		builder.WriteString(": ")
-		builder.WriteString(history[i].Content)
-		builder.WriteString("\n")
+func buildConversation(systemPrompt string, history []store.ChatMessage, userMessage string) []llm.ChatMessage {
+	var messages []llm.ChatMessage
+	if strings.TrimSpace(systemPrompt) != "" {
+		messages = append(messages, llm.ChatMessage{
+			Role:    "system",
+			Content: systemPrompt,
+		})
 	}
-	builder.WriteString("User: ")
-	builder.WriteString(userMessage)
-	return builder.String()
+	for i := len(history) - 1; i >= 0; i-- {
+		role := strings.ToLower(history[i].Role)
+		if role == "" {
+			continue
+		}
+		messages = append(messages, llm.ChatMessage{
+			Role:    role,
+			Content: history[i].Content,
+		})
+	}
+	messages = append(messages, llm.ChatMessage{
+		Role:    "user",
+		Content: userMessage,
+	})
+	return messages
 }

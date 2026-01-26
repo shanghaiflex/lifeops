@@ -163,10 +163,7 @@ type agentConfigYAML struct {
 }
 
 const DefaultDailyReviewPrompt = `Сделай короткий ежедневный обзор для пользователя.
-Опирайся на данные ниже и отвечай на русском.
-Тренировки и активность: {health_summary}
-Метрики здоровья: {metrics_summary}
-Финансы: {finance_summary}`
+Перед ответом получи актуальные данные через доступные инструменты и только потом сформулируй рекомендации на русском языке.`
 
 func parseAgentConfigYAML(data []byte) (agentConfigYAML, error) {
 	var cfg agentConfigYAML

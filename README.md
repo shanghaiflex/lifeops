@@ -44,6 +44,17 @@ make up
 - Set Health Bridge iOS app to send data to `http://<mac-ip>:8080`.
 - There is no authentication for LAN testing, so you can hit the ingest endpoints directly.
 
+### Triggering the worker on-demand
+`POST /v1/worker/run` lets you run the daily-review worker for any configured agent immediately. Example:
+
+```bash
+curl -X POST http://localhost:8080/v1/worker/run \
+  -H "Content-Type: application/json" \
+  -d '{"agent":"coach"}'
+```
+
+The request will use that agent’s Telegram token/chat list and send the generated message to the usual chat(s).
+
 ## Finance CSV ingestion
 - Place CSV files in `./data/finance` (mounted into the container).
 - Run:
@@ -103,7 +114,7 @@ Each YAML file supports:
 - `prompt`: the system prompt for chat.
 - `timezone`: IANA timezone name for the daily review schedule (defaults to `Europe/Moscow`).
 - `daily_review_time`: time of day (`HH:MM`) for the daily review.
-- `daily_review_prompt`: prompt template for the daily review (supports `{health_summary}`, `{metrics_summary}`, `{finance_summary}`).
+- `daily_review_prompt`: prompt text for the daily review. The worker automatically appends instructions describing every available tool, so keep this field focused on tone/style.
 
 Example:
 
@@ -114,10 +125,9 @@ prompt: |
   Ты ассистент по продуктивности.
 timezone: Europe/Moscow
 daily_review_time: "09:00"
-daily_review_prompt: |
-  Составь краткий обзор продуктивности за день.
-  Тренировки: {health_summary}
-  Метрики: {metrics_summary}
+  daily_review_prompt: |
+    Составь краткий обзор продуктивности за день.
+    Получи свежие данные через доступные инструменты и сформулируй рекомендации.
 EOF
 ```
 
