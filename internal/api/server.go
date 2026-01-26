@@ -7,26 +7,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/getkin/kin-openapi/routers"
 	"github.com/getkin/kin-openapi/routers/legacy"
 	"github.com/go-chi/chi/v5"
+	"lifeops/internal/config"
 	"lifeops/internal/health"
+	"lifeops/internal/llm"
+	"lifeops/internal/store"
+	"lifeops/internal/telegram"
+	"lifeops/internal/worker"
 )
 
 //go:embed openapi.yaml
 var openapiFS embed.FS
 
 type Server struct {
-	service *health.Service
-	router  *chi.Mux
+	service  *health.Service
+	router   *chi.Mux
+	store    *store.Store
+	cfg      *config.Config
+	provider llm.Provider
 }
 
-func NewServer(service *health.Service) (*Server, error) {
+func NewServer(service *health.Service, store *store.Store, cfg *config.Config, provider llm.Provider) (*Server, error) {
 	specBytes, err := openapiFS.ReadFile("openapi.yaml")
 	if err != nil {
 		return nil, fmt.Errorf("read openapi: %w", err)
@@ -44,8 +54,11 @@ func NewServer(service *health.Service) (*Server, error) {
 	router := chi.NewRouter()
 	router.Use(openapiMiddleware(openapiRouter))
 	s := &Server{
-		service: service,
-		router:  router,
+		service:  service,
+		router:   router,
+		store:    store,
+		cfg:      cfg,
+		provider: provider,
 	}
 	s.routes()
 	return s, nil
@@ -59,6 +72,7 @@ func (s *Server) routes() {
 	s.router.Post("/v1/ingest/health/workouts", s.handleWorkouts)
 	s.router.Post("/v1/ingest/health/sleep", s.handleSleep)
 	s.router.Post("/v1/ingest/health/metrics", s.handleMetrics)
+	s.router.Post("/v1/worker/run", s.handleWorkerRun)
 }
 
 func (s *Server) Router() http.Handler {
@@ -71,10 +85,12 @@ func (s *Server) handleWorkouts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.service.IngestWorkouts(r.Context(), payload); err != nil {
+	stats, err := s.service.IngestWorkouts(r.Context(), payload)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	log.Printf("ingest workouts: %d items (%d inserted, %d updated), %d deletions", len(payload.Items), stats.Inserted, stats.Updated, len(payload.Deleted))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -84,10 +100,12 @@ func (s *Server) handleSleep(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.service.IngestSleep(r.Context(), payload); err != nil {
+	stats, err := s.service.IngestSleep(r.Context(), payload)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	log.Printf("ingest sleep: %d items (%d inserted, %d updated), %d deletions", len(payload.Items), stats.Inserted, stats.Updated, len(payload.Deleted))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -97,11 +115,60 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.service.IngestMetrics(r.Context(), payload); err != nil {
+	stats, err := s.service.IngestMetrics(r.Context(), payload)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	logMetricSamples(payload.Items)
+	log.Printf("ingest metrics: %d items (%d inserted, %d updated), %d deletions", len(payload.Items), stats.Inserted, stats.Updated, len(payload.Deleted))
 	w.WriteHeader(http.StatusOK)
+}
+
+type workerRunRequest struct {
+	Agent string `json:"agent"`
+}
+
+func (s *Server) handleWorkerRun(w http.ResponseWriter, r *http.Request) {
+	var payload workerRunRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	agentName := strings.TrimSpace(payload.Agent)
+	if agentName == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("agent is required"))
+		return
+	}
+	agentCfg, ok := s.cfg.TelegramAgents[agentName]
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Errorf("agent %q not found", agentName))
+		return
+	}
+	token := strings.TrimSpace(agentCfg.TelegramToken)
+	if token == "" && len(s.cfg.TelegramBotTokens) > 0 {
+		if fallback, ok := s.cfg.TelegramBotTokens[agentName]; ok {
+			token = strings.TrimSpace(fallback)
+		}
+	}
+	if token == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("telegram token missing for agent %q", agentName))
+		return
+	}
+	sender, err := telegram.NewBotSender(token)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("telegram sender: %w", err))
+		return
+	}
+	workerInstance := worker.New(s.store, s.provider, sender, agentCfg, s.cfg.ChatHistoryLimit, agentCfg.DefaultChatIDs)
+	if err := workerInstance.RunOnce(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "ok",
+		"agent":  agentName,
+	})
 }
 
 func decodeJSON(r *http.Request, dest interface{}) error {
@@ -115,6 +182,11 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"error": err.Error(),
 	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func openapiMiddleware(validator routers.Router) func(http.Handler) http.Handler {
@@ -166,4 +238,33 @@ func Healthz(ctx context.Context, baseURL string) error {
 		return fmt.Errorf("healthz returned %s", resp.Status)
 	}
 	return nil
+}
+
+const metricLogPreviewLimit = 10
+
+func logMetricSamples(items []health.Metric) {
+	if len(items) == 0 {
+		return
+	}
+	limit := len(items)
+	if limit > metricLogPreviewLimit {
+		limit = metricLogPreviewLimit
+	}
+	for i := 0; i < limit; i++ {
+		item := items[i]
+		log.Printf(
+			"ingest metrics detail %d/%d: id=%s kind=%s start=%s end=%s value=%g unit=%s",
+			i+1,
+			len(items),
+			item.ID,
+			item.Kind,
+			item.Start.Format(time.RFC3339),
+			item.End.Format(time.RFC3339),
+			item.Value,
+			item.Unit,
+		)
+	}
+	if len(items) > metricLogPreviewLimit {
+		log.Printf("ingest metrics detail truncated: logged first %d of %d items", metricLogPreviewLimit, len(items))
+	}
 }

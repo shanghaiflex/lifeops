@@ -25,7 +25,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		log.Fatalf("usage: %s [api|bot|worker|worker-once|ingest-finance|seed-sample]", os.Args[0])
+		log.Fatalf("usage: %s [api|bot|worker|worker-once|worker-debug|ingest-finance|seed-sample]", os.Args[0])
 	}
 	mode := os.Args[1]
 
@@ -52,6 +52,12 @@ func main() {
 		runWorker(ctx, cfg, store, true)
 	case "worker-once":
 		runWorker(ctx, cfg, store, false)
+	case "worker-debug":
+		agentFilter := ""
+		if len(os.Args) > 2 {
+			agentFilter = os.Args[2]
+		}
+		runWorkerDebug(ctx, cfg, store, agentFilter)
 	case "ingest-finance":
 		runIngest(ctx, cfg, store)
 	case "seed-sample":
@@ -72,7 +78,8 @@ func buildProvider(cfg *config.Config) llm.Provider {
 
 func runAPI(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 	healthSvc := health.NewService(store)
-	server, err := api.NewServer(healthSvc)
+	provider := buildProvider(cfg)
+	server, err := api.NewServer(healthSvc, store, cfg, provider)
 	if err != nil {
 		log.Fatalf("api server: %v", err)
 	}
@@ -80,8 +87,9 @@ func runAPI(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 	httpServer := &http.Server{
 		Addr:         cfg.BindAddr,
 		Handler:      server.Router(),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 2 * time.Minute,
+		IdleTimeout:  2 * time.Minute,
 	}
 
 	go func() {
@@ -236,6 +244,45 @@ func runWorker(ctx context.Context, cfg *config.Config, store *storepkg.Store, l
 	}
 }
 
+func runWorkerDebug(ctx context.Context, cfg *config.Config, store *storepkg.Store, agentFilter string) {
+	provider := buildProvider(cfg)
+	observer := worker.NewDebugObserver(os.Stdout)
+	runForAgent := func(agent config.AgentConfig) {
+		var sender telegram.Sender = &telegram.NoopSender{}
+		w := worker.New(store, provider, sender, agent, cfg.ChatHistoryLimit, agent.DefaultChatIDs)
+		w.SetObserver(observer)
+		if err := w.RunOnce(ctx); err != nil {
+			log.Fatalf("worker debug (%s): %v", agent.Name, err)
+		}
+	}
+	if len(cfg.TelegramAgents) > 0 {
+		if agentFilter != "" {
+			agent, ok := cfg.TelegramAgents[agentFilter]
+			if !ok {
+				log.Fatalf("worker debug: unknown agent %s", agentFilter)
+			}
+			runForAgent(agent)
+			return
+		}
+		for name, agent := range cfg.TelegramAgents {
+			log.Printf("worker debug: running agent %s", name)
+			runForAgent(agent)
+		}
+		return
+	}
+	agent := config.AgentConfig{
+		Name:              "coach",
+		Prompt:            "",
+		DailyReviewPrompt: config.DefaultDailyReviewPrompt,
+		Timezone:          cfg.Timezone,
+		DailyReviewTime:   config.DailyReviewTime{Hour: 9, Minute: 0},
+	}
+	if cfg.TelegramChatID != 0 {
+		agent.DefaultChatIDs = []int64{cfg.TelegramChatID}
+	}
+	runForAgent(agent)
+}
+
 func runIngest(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 	ingestor := finance.NewIngestor(store)
 	count, err := ingestor.IngestDirectory(ctx, cfg.FinanceDataDir)
@@ -295,7 +342,7 @@ func seedHealthData(ctx context.Context, store *storepkg.Store) error {
 			}),
 		},
 	}
-	if err := store.UpsertWorkouts(ctx, workouts); err != nil {
+	if _, err := store.UpsertWorkouts(ctx, workouts); err != nil {
 		return err
 	}
 	sleeps := []storepkg.Sleep{
@@ -313,7 +360,7 @@ func seedHealthData(ctx context.Context, store *storepkg.Store) error {
 			}),
 		},
 	}
-	if err := store.UpsertSleep(ctx, sleeps); err != nil {
+	if _, err := store.UpsertSleep(ctx, sleeps); err != nil {
 		return err
 	}
 	metrics := []storepkg.Metric{
@@ -336,7 +383,8 @@ func seedHealthData(ctx context.Context, store *storepkg.Store) error {
 			Raw:   mustJSON(map[string]any{"value": 52}),
 		},
 	}
-	return store.UpsertMetrics(ctx, metrics)
+	_, err := store.UpsertMetrics(ctx, metrics)
+	return err
 }
 
 func seedFinanceData(ctx context.Context, store *storepkg.Store) error {

@@ -6,7 +6,7 @@ COPY . ./
 RUN go build -o /bin/lifeops ./cmd/lifeops
 
 FROM alpine:3.20
-RUN adduser -D -g '' appuser
+RUN apk add --no-cache tzdata && adduser -D -g '' appuser
 USER appuser
 WORKDIR /app
 COPY --from=build /bin/lifeops /bin/lifeops

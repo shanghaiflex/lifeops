@@ -1,75 +1,113 @@
 openapi: 3.0.3
 info:
-  title: Health Bridge Ingest API
-  version: 1.0.0
-  description: |
-    Local LAN ingest API for Health Bridge iOS app. All endpoints accept JSON
-    payloads with HealthKit UUIDs for idempotency. Auth is disabled for MVP.
+  title: LifeOps API
+  version: "1.0"
 servers:
-  - url: http://{host}:{port}
-    variables:
-      host:
-        default: 192.168.1.149
-      port:
-        default: "8080"
+  - url: http://localhost:8080
 paths:
-  /healthz:
-    get:
-      summary: Health check
-      responses:
-        "200":
-          description: OK
   /v1/ingest/health/workouts:
     post:
-      summary: Ingest workout samples
+      summary: Ingest workouts
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/WorkoutsBatch"
+              $ref: '#/components/schemas/WorkoutsBatch'
       responses:
-        "200":
+        '200':
           description: OK
   /v1/ingest/health/sleep:
     post:
-      summary: Ingest sleep samples
+      summary: Ingest sleep
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/SleepBatch"
+              $ref: '#/components/schemas/SleepBatch'
       responses:
-        "200":
+        '200':
           description: OK
   /v1/ingest/health/metrics:
     post:
-      summary: Ingest metric samples
+      summary: Ingest metrics
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/MetricsBatch"
+              $ref: '#/components/schemas/MetricsBatch'
       responses:
-        "200":
+        '200':
           description: OK
+  /v1/worker/run:
+    post:
+      summary: Trigger worker for agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                agent:
+                  type: string
+                  description: Agent name
+              required:
+                - agent
+      responses:
+        '200':
+          description: Worker executed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  agent:
+                    type: string
 components:
   schemas:
-    Deletion:
+    SleepBatch:
       type: object
-      required: [id, sampleType]
       properties:
-        id:
-          type: string
-          description: HealthKit UUID
-        sampleType:
-          type: string
-          description: Sample type identifier
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Sleep'
+        deleted:
+          type: array
+          items:
+            $ref: '#/components/schemas/Deletion'
+      required: [items, deleted]
+    WorkoutsBatch:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Workout'
+        deleted:
+          type: array
+          items:
+            $ref: '#/components/schemas/Deletion'
+      required: [items, deleted]
+    MetricsBatch:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Metric'
+        deleted:
+          type: array
+          items:
+            $ref: '#/components/schemas/Deletion'
+      required: [items, deleted]
     Workout:
       type: object
-      required: [id, workoutType, start, end, durationMinutes]
       properties:
         id:
           type: string
@@ -85,28 +123,18 @@ components:
           type: number
         distanceMeters:
           type: number
-          nullable: true
         calories:
           type: number
-          nullable: true
         averageHeartRate:
           type: number
-          nullable: true
-    SleepBreakdown:
-      type: object
-      required: [remMinutes, deepMinutes, coreMinutes, awakeMinutes]
-      properties:
-        remMinutes:
-          type: number
-        deepMinutes:
-          type: number
-        coreMinutes:
-          type: number
-        awakeMinutes:
-          type: number
+      required:
+        - id
+        - workoutType
+        - start
+        - end
+        - durationMinutes
     Sleep:
       type: object
-      required: [id, start, end, totalMinutes, breakdown]
       properties:
         id:
           type: string
@@ -119,16 +147,34 @@ components:
         totalMinutes:
           type: number
         breakdown:
-          $ref: "#/components/schemas/SleepBreakdown"
+          type: object
+          properties:
+            remMinutes:
+              type: number
+            deepMinutes:
+              type: number
+            coreMinutes:
+              type: number
+            awakeMinutes:
+              type: number
+          required:
+            - remMinutes
+            - deepMinutes
+            - coreMinutes
+            - awakeMinutes
+      required:
+        - id
+        - start
+        - end
+        - totalMinutes
+        - breakdown
     Metric:
       type: object
-      required: [id, kind, start, end, value, unit]
       properties:
         id:
           type: string
         kind:
           type: string
-          enum: [hrv_sdnn, resting_heart_rate, steps, active_energy]
         start:
           type: string
           format: date-time
@@ -139,39 +185,20 @@ components:
           type: number
         unit:
           type: string
-    WorkoutsBatch:
+      required:
+        - id
+        - kind
+        - start
+        - end
+        - value
+        - unit
+    Deletion:
       type: object
-      required: [items, deleted]
       properties:
-        items:
-          type: array
-          items:
-            $ref: "#/components/schemas/Workout"
-        deleted:
-          type: array
-          items:
-            $ref: "#/components/schemas/Deletion"
-    SleepBatch:
-      type: object
-      required: [items, deleted]
-      properties:
-        items:
-          type: array
-          items:
-            $ref: "#/components/schemas/Sleep"
-        deleted:
-          type: array
-          items:
-            $ref: "#/components/schemas/Deletion"
-    MetricsBatch:
-      type: object
-      required: [items, deleted]
-      properties:
-        items:
-          type: array
-          items:
-            $ref: "#/components/schemas/Metric"
-        deleted:
-          type: array
-          items:
-            $ref: "#/components/schemas/Deletion"
+        id:
+          type: string
+        sampleType:
+          type: string
+      required:
+        - id
+        - sampleType

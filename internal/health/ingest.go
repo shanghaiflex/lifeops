@@ -16,12 +16,13 @@ func NewService(store *store.Store) *Service {
 	return &Service{store: store}
 }
 
-func (s *Service) IngestWorkouts(ctx context.Context, batch WorkoutsBatch) error {
+func (s *Service) IngestWorkouts(ctx context.Context, batch WorkoutsBatch) (store.UpsertStats, error) {
+	var stats store.UpsertStats
 	workouts := make([]store.Workout, 0, len(batch.Items))
 	for _, item := range batch.Items {
 		raw, err := json.Marshal(item)
 		if err != nil {
-			return fmt.Errorf("marshal workout: %w", err)
+			return stats, fmt.Errorf("marshal workout: %w", err)
 		}
 		workouts = append(workouts, store.Workout{
 			ID:               item.ID,
@@ -35,18 +36,24 @@ func (s *Service) IngestWorkouts(ctx context.Context, batch WorkoutsBatch) error
 			Raw:              raw,
 		})
 	}
-	if err := s.store.UpsertWorkouts(ctx, workouts); err != nil {
-		return err
+	upsertStats, err := s.store.UpsertWorkouts(ctx, workouts)
+	if err != nil {
+		return stats, err
 	}
-	return s.applyDeletions(ctx, batch.Deleted)
+	stats = upsertStats
+	if err := s.applyDeletions(ctx, batch.Deleted); err != nil {
+		return stats, err
+	}
+	return stats, nil
 }
 
-func (s *Service) IngestSleep(ctx context.Context, batch SleepBatch) error {
+func (s *Service) IngestSleep(ctx context.Context, batch SleepBatch) (store.UpsertStats, error) {
+	var stats store.UpsertStats
 	sleeps := make([]store.Sleep, 0, len(batch.Items))
 	for _, item := range batch.Items {
 		raw, err := json.Marshal(item)
 		if err != nil {
-			return fmt.Errorf("marshal sleep: %w", err)
+			return stats, fmt.Errorf("marshal sleep: %w", err)
 		}
 		sleeps = append(sleeps, store.Sleep{
 			ID:           item.ID,
@@ -60,18 +67,24 @@ func (s *Service) IngestSleep(ctx context.Context, batch SleepBatch) error {
 			Raw:          raw,
 		})
 	}
-	if err := s.store.UpsertSleep(ctx, sleeps); err != nil {
-		return err
+	upsertStats, err := s.store.UpsertSleep(ctx, sleeps)
+	if err != nil {
+		return stats, err
 	}
-	return s.applyDeletions(ctx, batch.Deleted)
+	stats = upsertStats
+	if err := s.applyDeletions(ctx, batch.Deleted); err != nil {
+		return stats, err
+	}
+	return stats, nil
 }
 
-func (s *Service) IngestMetrics(ctx context.Context, batch MetricsBatch) error {
+func (s *Service) IngestMetrics(ctx context.Context, batch MetricsBatch) (store.UpsertStats, error) {
+	var stats store.UpsertStats
 	metrics := make([]store.Metric, 0, len(batch.Items))
 	for _, item := range batch.Items {
 		raw, err := json.Marshal(item)
 		if err != nil {
-			return fmt.Errorf("marshal metric: %w", err)
+			return stats, fmt.Errorf("marshal metric: %w", err)
 		}
 		metrics = append(metrics, store.Metric{
 			ID:    item.ID,
@@ -83,10 +96,15 @@ func (s *Service) IngestMetrics(ctx context.Context, batch MetricsBatch) error {
 			Raw:   raw,
 		})
 	}
-	if err := s.store.UpsertMetrics(ctx, metrics); err != nil {
-		return err
+	upsertStats, err := s.store.UpsertMetrics(ctx, metrics)
+	if err != nil {
+		return stats, err
 	}
-	return s.applyDeletions(ctx, batch.Deleted)
+	stats = upsertStats
+	if err := s.applyDeletions(ctx, batch.Deleted); err != nil {
+		return stats, err
+	}
+	return stats, nil
 }
 
 func (s *Service) applyDeletions(ctx context.Context, deletions []Deletion) error {
