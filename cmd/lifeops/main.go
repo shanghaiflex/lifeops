@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,14 +18,14 @@ import (
 	"lifeops/internal/finance"
 	"lifeops/internal/health"
 	"lifeops/internal/llm"
-	"lifeops/internal/store"
+	storepkg "lifeops/internal/store"
 	"lifeops/internal/telegram"
 	"lifeops/internal/worker"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		log.Fatalf("usage: %s [api|bot|worker|worker-once|ingest-finance]", os.Args[0])
+		log.Fatalf("usage: %s [api|bot|worker|worker-once|ingest-finance|seed-sample]", os.Args[0])
 	}
 	mode := os.Args[1]
 
@@ -35,7 +37,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	store, err := store.New(ctx, cfg.PostgresDSN)
+	store, err := storepkg.New(ctx, cfg.PostgresDSN)
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
@@ -52,21 +54,23 @@ func main() {
 		runWorker(ctx, cfg, store, false)
 	case "ingest-finance":
 		runIngest(ctx, cfg, store)
+	case "seed-sample":
+		runSeedSample(ctx, cfg, store)
 	default:
 		log.Fatalf("unknown mode %s", mode)
 	}
 }
 
 func buildProvider(cfg *config.Config) llm.Provider {
-	switch cfg.LLMProvider {
-	case "openai":
+	switch strings.ToLower(cfg.LLMProvider) {
+	case "openai", "openapi":
 		return llm.NewOpenAIProvider(cfg.OpenAIAPIKey, cfg.OpenAIModel)
 	default:
 		return &llm.MockProvider{}
 	}
 }
 
-func runAPI(ctx context.Context, cfg *config.Config, store *store.Store) {
+func runAPI(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 	healthSvc := health.NewService(store)
 	server, err := api.NewServer(healthSvc)
 	if err != nil {
@@ -93,48 +97,49 @@ func runAPI(ctx context.Context, cfg *config.Config, store *store.Store) {
 	}
 }
 
-func runBot(ctx context.Context, cfg *config.Config, store *store.Store) {
+func runBot(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 	provider := buildProvider(cfg)
-	if len(cfg.TelegramAgents) > 0 && len(cfg.TelegramBotTokens) > 0 {
-		errCh := make(chan error, len(cfg.TelegramBotTokens))
+	if len(cfg.TelegramAgents) > 0 {
+		errCh := make(chan error, len(cfg.TelegramAgents))
 		started := 0
-		for agent, token := range cfg.TelegramBotTokens {
-			agent := agent
-			token := token
-			agentCfg, ok := cfg.TelegramAgents[agent]
-			if !ok {
-				log.Printf("telegram bot token provided for %s but no agent config found", agent)
+		for agentName, agentCfg := range cfg.TelegramAgents {
+			agentCfg := agentCfg
+			token := agentCfg.TelegramToken
+			if token == "" && len(cfg.TelegramBotTokens) > 0 {
+				token = cfg.TelegramBotTokens[agentName]
+			}
+			if token == "" {
+				log.Printf("telegram bot token missing for agent %s; skipping bot startup", agentName)
 				continue
 			}
 			started++
-			go func() {
+			go func(token string, agentCfg config.AgentConfig) {
 				bot, err := tgbotapi.NewBotAPI(token)
 				if err != nil {
-					errCh <- fmt.Errorf("telegram %s: %w", agent, err)
+					errCh <- fmt.Errorf("telegram %s: %w", agentCfg.Name, err)
 					return
 				}
 				sender := telegram.NewBotSenderFromBot(bot)
 				handler := telegram.NewHandler(store, provider, sender, bot, telegram.HandlerConfig{
-					Agent:        agent,
+					Agent:        agentCfg.Name,
 					HistoryLimit: cfg.ChatHistoryLimit,
 					Prompt:       agentCfg.Prompt,
 				})
 				if err := handler.Run(ctx); err != nil && ctx.Err() == nil {
-					errCh <- fmt.Errorf("bot %s: %w", agent, err)
+					errCh <- fmt.Errorf("bot %s: %w", agentCfg.Name, err)
 				}
-			}()
+			}(token, agentCfg)
 		}
-		if started == 0 {
-			log.Printf("telegram bot tokens provided but no matching agent configs; skipping bot startup")
+		if started > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case err := <-errCh:
+				log.Fatalf("bot: %v", err)
+			}
 			return
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case err := <-errCh:
-			log.Fatalf("bot: %v", err)
-		}
-		return
+		log.Printf("telegram agent configs present but no valid tokens found; falling back to default bot")
 	}
 	bot, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
 	if err != nil {
@@ -149,14 +154,18 @@ func runBot(ctx context.Context, cfg *config.Config, store *store.Store) {
 	}
 }
 
-func runWorker(ctx context.Context, cfg *config.Config, store *store.Store, loop bool) {
+func runWorker(ctx context.Context, cfg *config.Config, store *storepkg.Store, loop bool) {
 	provider := buildProvider(cfg)
-	if len(cfg.TelegramAgents) > 0 && len(cfg.TelegramBotTokens) > 0 {
+	if len(cfg.TelegramAgents) > 0 {
 		errCh := make(chan error, len(cfg.TelegramAgents))
 		started := 0
 		for name, agent := range cfg.TelegramAgents {
-			token, ok := cfg.TelegramBotTokens[name]
-			if !ok {
+			agent := agent
+			token := agent.TelegramToken
+			if token == "" && len(cfg.TelegramBotTokens) > 0 {
+				token = cfg.TelegramBotTokens[name]
+			}
+			if token == "" {
 				log.Printf("telegram bot token missing for agent %s; skipping daily review", name)
 				continue
 			}
@@ -164,7 +173,7 @@ func runWorker(ctx context.Context, cfg *config.Config, store *store.Store, loop
 			if err != nil {
 				log.Fatalf("telegram sender: %v", err)
 			}
-			w := worker.New(store, provider, sender, agent, cfg.ChatHistoryLimit, nil)
+			w := worker.New(store, provider, sender, agent, cfg.ChatHistoryLimit, agent.DefaultChatIDs)
 			started++
 			go func() {
 				if loop {
@@ -178,23 +187,23 @@ func runWorker(ctx context.Context, cfg *config.Config, store *store.Store, loop
 		}
 		if started == 0 {
 			log.Printf("no agent workers started for daily review")
-			return
-		}
-		if loop {
-			select {
-			case <-ctx.Done():
-				return
-			case err := <-errCh:
-				log.Fatalf("worker: %v", err)
-			}
 		} else {
-			for i := 0; i < started; i++ {
-				if err := <-errCh; err != nil {
-					log.Fatalf("worker once: %v", err)
+			if loop {
+				select {
+				case <-ctx.Done():
+					return
+				case err := <-errCh:
+					log.Fatalf("worker: %v", err)
+				}
+			} else {
+				for i := 0; i < started; i++ {
+					if err := <-errCh; err != nil {
+						log.Fatalf("worker once: %v", err)
+					}
 				}
 			}
+			return
 		}
-		return
 	}
 	var sender telegram.Sender = &telegram.NoopSender{}
 	if cfg.TelegramToken != "" {
@@ -227,11 +236,172 @@ func runWorker(ctx context.Context, cfg *config.Config, store *store.Store, loop
 	}
 }
 
-func runIngest(ctx context.Context, cfg *config.Config, store *store.Store) {
+func runIngest(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 	ingestor := finance.NewIngestor(store)
 	count, err := ingestor.IngestDirectory(ctx, cfg.FinanceDataDir)
 	if err != nil {
 		log.Fatalf("ingest finance: %v", err)
 	}
 	fmt.Printf("Imported %d transactions\n", count)
+}
+
+func runSeedSample(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
+	if err := seedHealthData(ctx, store); err != nil {
+		log.Fatalf("seed health: %v", err)
+	}
+	if err := seedFinanceData(ctx, store); err != nil {
+		log.Fatalf("seed finance: %v", err)
+	}
+	log.Printf("Seeded demo data into %s", cfg.PostgresDSN)
+}
+
+func seedHealthData(ctx context.Context, store *storepkg.Store) error {
+	now := time.Now().UTC()
+	workouts := []storepkg.Workout{
+		{
+			ID:              "seed-workout-run",
+			WorkoutType:     "run",
+			Start:           now.AddDate(0, 0, -2).Add(-30 * time.Minute),
+			End:             now.AddDate(0, 0, -2).Add(30 * time.Minute),
+			DurationMinutes: 60,
+			DistanceMeters: func() *float64 {
+				v := 8500.0
+				return &v
+			}(),
+			Calories: func() *float64 {
+				v := 720.0
+				return &v
+			}(),
+			AverageHeartRate: func() *float64 {
+				v := 152.0
+				return &v
+			}(),
+			Raw: mustJSON(map[string]any{
+				"type": "run",
+			}),
+		},
+		{
+			ID:              "seed-workout-swim",
+			WorkoutType:     "swim",
+			Start:           now.AddDate(0, 0, -1).Add(-45 * time.Minute),
+			End:             now.AddDate(0, 0, -1).Add(15 * time.Minute),
+			DurationMinutes: 60,
+			Calories: func() *float64 {
+				v := 500.0
+				return &v
+			}(),
+			Raw: mustJSON(map[string]any{
+				"type": "swim",
+			}),
+		},
+	}
+	if err := store.UpsertWorkouts(ctx, workouts); err != nil {
+		return err
+	}
+	sleeps := []storepkg.Sleep{
+		{
+			ID:           "seed-sleep-1",
+			Start:        time.Date(now.Year(), now.Month(), now.Day()-1, 23, 0, 0, 0, time.UTC),
+			End:          time.Date(now.Year(), now.Month(), now.Day(), 7, 0, 0, 0, time.UTC),
+			TotalMinutes: 480,
+			RemMinutes:   90,
+			DeepMinutes:  70,
+			CoreMinutes:  270,
+			AwakeMinutes: 50,
+			Raw: mustJSON(map[string]any{
+				"quality": "good",
+			}),
+		},
+	}
+	if err := store.UpsertSleep(ctx, sleeps); err != nil {
+		return err
+	}
+	metrics := []storepkg.Metric{
+		{
+			ID:    "seed-metric-hrv",
+			Kind:  "HRV",
+			Start: now.AddDate(0, 0, -1),
+			End:   now.AddDate(0, 0, -1).Add(time.Hour),
+			Value: 85,
+			Unit:  "ms",
+			Raw:   mustJSON(map[string]any{"value": 85}),
+		},
+		{
+			ID:    "seed-metric-resting_hr",
+			Kind:  "resting_hr",
+			Start: now.AddDate(0, 0, -1),
+			End:   now.AddDate(0, 0, -1).Add(time.Hour),
+			Value: 52,
+			Unit:  "bpm",
+			Raw:   mustJSON(map[string]any{"value": 52}),
+		},
+	}
+	return store.UpsertMetrics(ctx, metrics)
+}
+
+func seedFinanceData(ctx context.Context, store *storepkg.Store) error {
+	today := time.Now().UTC()
+	raws := []storepkg.FinanceRaw{
+		{
+			SourceFile: "seed.csv",
+			RowNum:     1,
+			Payload:    mustJSON(map[string]any{"description": "Cafe"}),
+		},
+		{
+			SourceFile: "seed.csv",
+			RowNum:     2,
+			Payload:    mustJSON(map[string]any{"description": "Gym"}),
+		},
+		{
+			SourceFile: "seed.csv",
+			RowNum:     3,
+			Payload:    mustJSON(map[string]any{"description": "Salary"}),
+		},
+	}
+	rawIDs, err := store.InsertFinanceRaw(ctx, raws)
+	if err != nil {
+		return err
+	}
+	txs := []storepkg.FinanceTransaction{
+		{
+			Date:        today.AddDate(0, 0, -3),
+			Amount:      -25.5,
+			Currency:    "EUR",
+			Description: "Cafe breakfast",
+			Category:    "food",
+			Merchant:    "Daily Cafe",
+			RawID:       rawIDs[0],
+		},
+		{
+			Date:        today.AddDate(0, 0, -2),
+			Amount:      -60,
+			Currency:    "EUR",
+			Description: "Gym membership",
+			Category:    "fitness",
+			Merchant:    "Gym Club",
+			IsSub:       true,
+			RawID:       rawIDs[1],
+		},
+		{
+			Date:        today.AddDate(0, 0, -5),
+			Amount:      2500,
+			Currency:    "EUR",
+			Description: "Salary",
+			Category:    "income",
+			Merchant:    "Acme Corp",
+			RawID:       rawIDs[2],
+		},
+	}
+	if err := store.InsertFinanceTransactions(ctx, txs); err != nil {
+		return err
+	}
+	return store.RebuildFinanceAggregates(ctx)
+}
+
+func mustJSON(v any) json.RawMessage {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return data
 }

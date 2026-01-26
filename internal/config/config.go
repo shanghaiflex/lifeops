@@ -148,6 +148,8 @@ type AgentConfig struct {
 	DailyReviewPrompt string
 	Timezone          *time.Location
 	DailyReviewTime   DailyReviewTime
+	TelegramToken     string
+	DefaultChatIDs    []int64
 }
 
 type agentConfigYAML struct {
@@ -156,6 +158,8 @@ type agentConfigYAML struct {
 	DailyReviewPrompt string `yaml:"daily_review_prompt"`
 	Timezone          string `yaml:"timezone"`
 	DailyReviewTime   string `yaml:"daily_review_time"`
+	TelegramToken     string `yaml:"telegram_token"`
+	ChatID            string `yaml:"chat_id"`
 }
 
 const DefaultDailyReviewPrompt = `Сделай короткий ежедневный обзор для пользователя.
@@ -231,6 +235,10 @@ func parseAgentConfigYAML(data []byte) (agentConfigYAML, error) {
 			cfg.Timezone = value
 		case "daily_review_time":
 			cfg.DailyReviewTime = value
+		case "telegram_token":
+			cfg.TelegramToken = value
+		case "chat_id":
+			cfg.ChatID = value
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -304,6 +312,14 @@ func readAgentConfigs(dir string) (map[string]AgentConfig, error) {
 		}
 		if agent.DailyReviewPrompt == "" {
 			agent.DailyReviewPrompt = DefaultDailyReviewPrompt
+		}
+		agent.TelegramToken = strings.TrimSpace(raw.TelegramToken)
+		if chatID := strings.TrimSpace(raw.ChatID); chatID != "" {
+			parsedID, err := strconv.ParseInt(chatID, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("parse chat_id for %s: %w", agentName, err)
+			}
+			agent.DefaultChatIDs = []int64{parsedID}
 		}
 		out[agentName] = agent
 	}

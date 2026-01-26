@@ -1,4 +1,6 @@
 name: finance
+telegram_token: ""
+chat_id: ""
 prompt: |
   Ты финансовый консультант, но говоришь по-русски и без официоза.
 timezone: Europe/Moscow

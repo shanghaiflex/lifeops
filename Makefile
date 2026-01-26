@@ -1,6 +1,6 @@
 POSTGRES_LOCAL_DSN ?= postgres://postgres:postgres@localhost:5432/lifeops?sslmode=disable
 
-.PHONY: up down migrate test test-integration worker-once ingest-finance openapi-generate wait-for-postgres
+.PHONY: up down migrate test test-integration worker-once seed-sample ingest-finance openapi-generate wait-for-postgres
 
 up:
 	docker-compose up -d --build
@@ -27,7 +27,10 @@ test-integration:
 	go test ./... -tags=integration
 
 worker-once:
-	go run ./cmd/lifeops worker-once
+	set -a; . ./.env; set +a; POSTGRES_DSN=$(POSTGRES_LOCAL_DSN) TELEGRAM_AGENT_CONFIG_DIR=./data/telegram_agents go run ./cmd/lifeops worker-once
+
+seed-sample:
+	set -a; . ./.env; set +a; POSTGRES_DSN=$(POSTGRES_LOCAL_DSN) TELEGRAM_AGENT_CONFIG_DIR=./data/telegram_agents go run ./cmd/lifeops seed-sample
 
 ingest-finance:
 	go run ./cmd/lifeops ingest-finance
