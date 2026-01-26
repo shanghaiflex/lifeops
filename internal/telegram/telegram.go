@@ -43,20 +43,36 @@ func (b *BotSender) SendMessage(ctx context.Context, chatID int64, text string) 
 }
 
 type Handler struct {
-	store    *store.Store
-	provider llm.Provider
-	sender   Sender
-	bot      *tgbotapi.BotAPI
-	mode     map[int64]string
+	store        *store.Store
+	provider     llm.Provider
+	sender       Sender
+	bot          *tgbotapi.BotAPI
+	mode         map[int64]string
+	agent        string
+	historyLimit int
+	prompt       string
 }
 
-func NewHandler(store *store.Store, provider llm.Provider, sender Sender, bot *tgbotapi.BotAPI) *Handler {
+type HandlerConfig struct {
+	Agent        string
+	HistoryLimit int
+	Prompt       string
+}
+
+func NewHandler(store *store.Store, provider llm.Provider, sender Sender, bot *tgbotapi.BotAPI, cfg HandlerConfig) *Handler {
+	historyLimit := cfg.HistoryLimit
+	if historyLimit <= 0 {
+		historyLimit = 20
+	}
 	return &Handler{
-		store:    store,
-		provider: provider,
-		sender:   sender,
-		bot:      bot,
-		mode:     map[int64]string{},
+		store:        store,
+		provider:     provider,
+		sender:       sender,
+		bot:          bot,
+		mode:         map[int64]string{},
+		agent:        cfg.Agent,
+		historyLimit: historyLimit,
+		prompt:       cfg.Prompt,
 	}
 }
 
@@ -84,24 +100,38 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) erro
 	chatID := msg.Chat.ID
 	switch {
 	case text == "/start":
+		if h.agent != "" {
+			return h.sender.SendMessage(ctx, chatID, fmt.Sprintf("Welcome to LifeOps %s bot! Ask me anything.", h.agent))
+		}
 		return h.sender.SendMessage(ctx, chatID, "Welcome to LifeOps! Use /coach /sleep /finance to switch modes.")
 	case text == "/whoami":
 		return h.sender.SendMessage(ctx, chatID, fmt.Sprintf("chat_id=%d", chatID))
 	case text == "/daily":
 		return h.sender.SendMessage(ctx, chatID, "Daily digest will be sent by the worker.")
 	case text == "/coach", text == "/sleep", text == "/finance":
+		if h.agent != "" {
+			return h.sender.SendMessage(ctx, chatID, fmt.Sprintf("This bot is for %s. Use that bot for chat.", h.agent))
+		}
 		h.mode[chatID] = strings.TrimPrefix(text, "/")
 		return h.sender.SendMessage(ctx, chatID, fmt.Sprintf("Switched to %s mode.", h.mode[chatID]))
 	}
 
-	agent := h.mode[chatID]
+	agent := h.agent
+	if agent == "" {
+		agent = h.mode[chatID]
+	}
 	if agent == "" {
 		agent = "coach"
+	}
+	history, err := h.store.ChatHistory(ctx, chatID, agent, h.historyLimit)
+	if err != nil {
+		return err
 	}
 	if err := h.store.SaveChatMessage(ctx, chatID, agent, "user", text); err != nil {
 		return err
 	}
-	response, err := h.provider.Chat(ctx, buildChatPrompt(agent, text))
+	systemPrompt := ResolvePrompt(agent, h.prompt)
+	response, err := h.provider.Chat(ctx, BuildChatPrompt(systemPrompt, text, history))
 	if err != nil {
 		return err
 	}
@@ -111,13 +141,24 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) erro
 	return h.sender.SendMessage(ctx, chatID, response)
 }
 
-func buildChatPrompt(agent string, userMessage string) string {
-	switch agent {
-	case "sleep":
-		return "Ты эксперт по сну и восстановлению. Говори по-русски, дружелюбно и неформально. Вопрос: " + userMessage
-	case "finance":
-		return "Ты финансовый консультант, но говоришь по-русски и без официоза. Вопрос: " + userMessage
-	default:
-		return "Ты спортивный тренер. Отвечай на русском, легко и неформально. Вопрос: " + userMessage
+func BuildChatPrompt(systemPrompt string, userMessage string, history []store.ChatMessage) string {
+	var builder strings.Builder
+	builder.WriteString(systemPrompt)
+	builder.WriteString("\n\n")
+	for i := len(history) - 1; i >= 0; i-- {
+		roleLabel := "User"
+		switch history[i].Role {
+		case "assistant":
+			roleLabel = "Assistant"
+		case "system":
+			roleLabel = "System"
+		}
+		builder.WriteString(roleLabel)
+		builder.WriteString(": ")
+		builder.WriteString(history[i].Content)
+		builder.WriteString("\n")
 	}
+	builder.WriteString("User: ")
+	builder.WriteString(userMessage)
+	return builder.String()
 }

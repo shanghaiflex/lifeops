@@ -378,6 +378,28 @@ func (s *Store) ChatHistory(ctx context.Context, chatID int64, agent string, lim
 	return out, rows.Err()
 }
 
+func (s *Store) ChatIDsForAgent(ctx context.Context, agent string) ([]int64, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT chat_id
+		FROM chat_messages
+		WHERE agent = $1
+		ORDER BY chat_id
+	`, agent)
+	if err != nil {
+		return nil, fmt.Errorf("chat ids for agent: %w", err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var chatID int64
+		if err := rows.Scan(&chatID); err != nil {
+			return nil, fmt.Errorf("chat ids scan: %w", err)
+		}
+		out = append(out, chatID)
+	}
+	return out, rows.Err()
+}
+
 type ChatMessage struct {
 	Role    string
 	Content string
