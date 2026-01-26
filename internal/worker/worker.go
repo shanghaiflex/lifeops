@@ -20,6 +20,7 @@ type SummaryStore interface {
 	RecentWorkouts(ctx context.Context, since time.Time, limit int) ([]store.Workout, error)
 	RecentSleep(ctx context.Context, since time.Time, limit int) ([]store.Sleep, error)
 	RecentMetrics(ctx context.Context, since time.Time, limit int, kinds []string) ([]store.Metric, error)
+	RecentNutritionEntries(ctx context.Context, chatID int64, since time.Time, limit int) ([]store.NutritionEntry, error)
 	ChatHistory(ctx context.Context, chatID int64, agent string, limit int) ([]store.ChatMessage, error)
 	SaveChatMessage(ctx context.Context, chatID int64, agent string, role string, content string) error
 	ChatIDsForAgent(ctx context.Context, agent string) ([]int64, error)
@@ -100,6 +101,7 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 }
 
 func (w *Worker) runDailyReview(ctx context.Context, chatID int64) error {
+	w.tools.SetChatContext(chatID)
 	history, err := w.store.ChatHistory(ctx, chatID, w.agent.Name, w.historyLimit)
 	if err != nil {
 		return err

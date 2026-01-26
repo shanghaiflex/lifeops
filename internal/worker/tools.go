@@ -14,13 +14,16 @@ import (
 type toolHandler func(ctx context.Context, args json.RawMessage) (string, error)
 
 type toolRegistry struct {
+	store       SummaryStore
 	definitions []llm.ToolDefinition
 	handlers    map[string]toolHandler
 	timezone    *time.Location
+	chatID      int64
 }
 
 func newToolRegistry(store SummaryStore, timezone *time.Location) *toolRegistry {
 	registry := &toolRegistry{
+		store:    store,
 		handlers: make(map[string]toolHandler),
 		timezone: timezone,
 	}
@@ -53,8 +56,8 @@ func newToolRegistry(store SummaryStore, timezone *time.Location) *toolRegistry 
 			return "", err
 		}
 		args.applyDefaults(7, 10, 30, 50)
-		since := time.Now().In(timezone).AddDate(0, 0, -args.LookbackDays)
-		workouts, err := store.RecentWorkouts(ctx, since, args.Limit)
+		since := time.Now().In(registry.timezone).AddDate(0, 0, -args.LookbackDays)
+		workouts, err := registry.store.RecentWorkouts(ctx, since, args.Limit)
 		if err != nil {
 			return "", err
 		}
@@ -93,8 +96,8 @@ func newToolRegistry(store SummaryStore, timezone *time.Location) *toolRegistry 
 			return "", err
 		}
 		args.applyDefaults(7, 10, 30, 30)
-		since := time.Now().In(timezone).AddDate(0, 0, -args.LookbackDays)
-		data, err := store.RecentSleep(ctx, since, args.Limit)
+		since := time.Now().In(registry.timezone).AddDate(0, 0, -args.LookbackDays)
+		data, err := registry.store.RecentSleep(ctx, since, args.Limit)
 		if err != nil {
 			return "", err
 		}
@@ -140,8 +143,8 @@ func newToolRegistry(store SummaryStore, timezone *time.Location) *toolRegistry 
 			return "", err
 		}
 		args.rangeArgs.applyDefaults(7, 15, 30, 50)
-		since := time.Now().In(timezone).AddDate(0, 0, -args.LookbackDays)
-		data, err := store.RecentMetrics(ctx, since, args.Limit, args.Kinds)
+		since := time.Now().In(registry.timezone).AddDate(0, 0, -args.LookbackDays)
+		data, err := registry.store.RecentMetrics(ctx, since, args.Limit, args.Kinds)
 		if err != nil {
 			return "", err
 		}
@@ -182,14 +185,57 @@ func newToolRegistry(store SummaryStore, timezone *time.Location) *toolRegistry 
 		if args.LookbackDays > 30 {
 			args.LookbackDays = 30
 		}
-		since := time.Now().In(timezone).AddDate(0, 0, -args.LookbackDays)
-		summary, err := store.RecentFinanceSummary(ctx, since)
+		since := time.Now().In(registry.timezone).AddDate(0, 0, -args.LookbackDays)
+		summary, err := registry.store.RecentFinanceSummary(ctx, since)
 		if err != nil {
 			return "", err
 		}
 		payload := map[string]any{
 			"lookback_days": args.LookbackDays,
 			"summary":       summary,
+		}
+		return marshalPayload(payload)
+	})
+
+	registry.register(llm.ToolDefinition{
+		Name:        "retrieve_nutrition_logs",
+		Description: "Возвращает последние записи о питании из чата нутрициониста. Используй перед анализом рациона.",
+		Parameters: map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"required":             []string{"lookback_days", "limit"},
+			"properties": map[string]any{
+				"lookback_days": map[string]any{
+					"type":        "integer",
+					"description": "Сколько дней истории питания вернуть (1-30).",
+					"minimum":     1,
+					"maximum":     30,
+				},
+				"limit": map[string]any{
+					"type":        "integer",
+					"description": "Максимум записей (1-50).",
+					"minimum":     1,
+					"maximum":     50,
+				},
+			},
+		},
+	}, func(ctx context.Context, raw json.RawMessage) (string, error) {
+		if registry.chatID == 0 {
+			return "", fmt.Errorf("retrieve_nutrition_logs: chat context is required")
+		}
+		var args rangeArgs
+		if err := decodeArgs(raw, &args); err != nil {
+			return "", err
+		}
+		args.applyDefaults(3, 20, 30, 50)
+		since := time.Now().In(registry.timezone).AddDate(0, 0, -args.LookbackDays)
+		data, err := registry.store.RecentNutritionEntries(ctx, registry.chatID, since, args.Limit)
+		if err != nil {
+			return "", err
+		}
+		payload := map[string]any{
+			"lookback_days": args.LookbackDays,
+			"items":         serializeNutritionEntries(data),
 		}
 		return marshalPayload(payload)
 	})
@@ -228,6 +274,10 @@ func (t *toolRegistry) Describe() string {
 		parts[i] = fmt.Sprintf("%s — %s", def.Name, def.Description)
 	}
 	return strings.Join(parts, "; ")
+}
+
+func (t *toolRegistry) SetChatContext(chatID int64) {
+	t.chatID = chatID
 }
 
 type rangeArgs struct {
@@ -324,6 +374,35 @@ func serializeMetrics(metrics []store.Metric) []map[string]any {
 			"unit":  m.Unit,
 			"start": m.Start.Format(time.RFC3339),
 			"end":   m.End.Format(time.RFC3339),
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func serializeNutritionEntries(entries []store.NutritionEntry) []map[string]any {
+	out := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		item := map[string]any{
+			"id":            entry.ID,
+			"summary":       entry.Summary,
+			"original_text": entry.OriginalText,
+			"message_ts":    entry.MessageTS.Format(time.RFC3339),
+		}
+		if entry.Calories != nil {
+			item["calories"] = *entry.Calories
+		}
+		if entry.ProteinGrams != nil {
+			item["protein_g"] = *entry.ProteinGrams
+		}
+		if entry.CarbsGrams != nil {
+			item["carbs_g"] = *entry.CarbsGrams
+		}
+		if entry.FatGrams != nil {
+			item["fat_g"] = *entry.FatGrams
+		}
+		if strings.TrimSpace(entry.PhotoFileID) != "" {
+			item["photo_file_id"] = entry.PhotoFileID
 		}
 		out = append(out, item)
 	}

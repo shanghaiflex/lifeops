@@ -289,6 +289,7 @@ func readAgentConfigs(dir string) (map[string]AgentConfig, error) {
 			Prompt:            strings.TrimSpace(raw.Prompt),
 			DailyReviewPrompt: strings.TrimSpace(raw.DailyReviewPrompt),
 		}
+		agent.TelegramToken = resolveEnvReference(strings.TrimSpace(raw.TelegramToken))
 		tzName := strings.TrimSpace(raw.Timezone)
 		if tzName == "" {
 			tzName = "Europe/Moscow"
@@ -310,8 +311,7 @@ func readAgentConfigs(dir string) (map[string]AgentConfig, error) {
 		if agent.DailyReviewPrompt == "" {
 			agent.DailyReviewPrompt = DefaultDailyReviewPrompt
 		}
-		agent.TelegramToken = strings.TrimSpace(raw.TelegramToken)
-		if chatID := strings.TrimSpace(raw.ChatID); chatID != "" {
+		if chatID := resolveEnvReference(strings.TrimSpace(raw.ChatID)); chatID != "" {
 			parsedID, err := strconv.ParseInt(chatID, 10, 64)
 			if err != nil {
 				return nil, fmt.Errorf("parse chat_id for %s: %w", agentName, err)
@@ -321,4 +321,26 @@ func readAgentConfigs(dir string) (map[string]AgentConfig, error) {
 		out[agentName] = agent
 	}
 	return out, nil
+}
+
+func resolveEnvReference(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "${") && strings.HasSuffix(trimmed, "}") {
+		key := strings.TrimSpace(trimmed[2 : len(trimmed)-1])
+		if key == "" {
+			return ""
+		}
+		return os.Getenv(key)
+	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "env:") {
+		key := strings.TrimSpace(trimmed[4:])
+		if key == "" {
+			return ""
+		}
+		return os.Getenv(key)
+	}
+	return trimmed
 }

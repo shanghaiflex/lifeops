@@ -16,10 +16,12 @@ type fakeStore struct {
 	workouts       []store.Workout
 	sleep          []store.Sleep
 	metrics        []store.Metric
+	nutrition      map[int64][]store.NutritionEntry
 	financeSummary string
 	history        map[int64][]store.ChatMessage
 	chatIDs        []int64
 	savedMessages  []savedMessage
+	nutritionCalls []int64
 }
 
 type savedMessage struct {
@@ -55,6 +57,18 @@ func (f *fakeStore) RecentMetrics(_ context.Context, _ time.Time, limit int, _ [
 		return f.metrics[:limit], nil
 	}
 	return f.metrics, nil
+}
+
+func (f *fakeStore) RecentNutritionEntries(_ context.Context, chatID int64, _ time.Time, limit int) ([]store.NutritionEntry, error) {
+	f.nutritionCalls = append(f.nutritionCalls, chatID)
+	if f.nutrition == nil {
+		return nil, nil
+	}
+	entries := f.nutrition[chatID]
+	if limit > 0 && len(entries) > limit {
+		return entries[:limit], nil
+	}
+	return entries, nil
 }
 
 func (f *fakeStore) ChatHistory(_ context.Context, chatID int64, _ string, _ int) ([]store.ChatMessage, error) {
@@ -157,4 +171,46 @@ func TestWorkerRunOnceUsesDefaultChatIDs(t *testing.T) {
 func TestRenderDailyReviewPrompt(t *testing.T) {
 	out := renderDailyReviewPrompt("  Prompt text  ")
 	require.Equal(t, "Prompt text", out)
+}
+
+func TestWorkerNutritionToolUsesChatContext(t *testing.T) {
+	provider := &llm.MockProvider{
+		Responses: []llm.MockChatResponse{
+			{
+				ToolCalls: []llm.ToolCall{
+					{ID: "tool-1", Name: "retrieve_nutrition_logs", Arguments: json.RawMessage(`{"lookback_days":2,"limit":5}`)},
+				},
+			},
+			{
+				Content: "Nutrition summary",
+			},
+		},
+	}
+	sender := &mockSender{}
+	entry := store.NutritionEntry{
+		ID:           1,
+		ChatID:       555,
+		MessageTS:    time.Now(),
+		OriginalText: "каша с орехами",
+		Summary:      "Овсянка с орехами",
+	}
+	testStore := &fakeStore{
+		chatIDs: []int64{555},
+		nutrition: map[int64][]store.NutritionEntry{
+			555: {entry},
+		},
+	}
+	agent := config.AgentConfig{
+		Name:            "coach",
+		Prompt:          "Prompt",
+		Timezone:        time.UTC,
+		DailyReviewTime: config.DailyReviewTime{Hour: 9, Minute: 0},
+	}
+
+	worker := New(testStore, provider, sender, agent, 5, nil)
+	require.NoError(t, worker.RunOnce(context.Background()))
+	require.Len(t, testStore.nutritionCalls, 1)
+	require.Equal(t, int64(555), testStore.nutritionCalls[0])
+	require.Len(t, sender.sent, 1)
+	require.Equal(t, "Nutrition summary", sender.sent[0].text)
 }
