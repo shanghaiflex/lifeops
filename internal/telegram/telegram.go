@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"lifeops/internal/config"
 	"lifeops/internal/llm"
 	"lifeops/internal/store"
 )
@@ -16,6 +18,8 @@ import (
 type Sender interface {
 	SendMessage(ctx context.Context, chatID int64, text string) error
 }
+
+const handlerMaxToolIterations = 5
 
 type NoopSender struct{}
 
@@ -46,20 +50,29 @@ func (b *BotSender) SendMessage(ctx context.Context, chatID int64, text string) 
 }
 
 type Handler struct {
-	store        *store.Store
-	provider     llm.Provider
-	sender       Sender
-	bot          *tgbotapi.BotAPI
-	mode         map[int64]string
-	agent        string
-	historyLimit int
-	prompt       string
+	store             *store.Store
+	provider          llm.Provider
+	sender            Sender
+	bot               *tgbotapi.BotAPI
+	mode              map[int64]string
+	agent             string
+	historyLimit      int
+	prompt            string
+	agentConfig       *config.AgentConfig
+	nutritionFollowUp func(ctx context.Context, chatID int64) error
+	isNutritionLogBot bool
+	hasDedicatedLog   bool
+	tools             toolExecutor
 }
 
 type HandlerConfig struct {
-	Agent        string
-	HistoryLimit int
-	Prompt       string
+	Agent             string
+	HistoryLimit      int
+	Prompt            string
+	AgentConfig       *config.AgentConfig
+	NutritionFollowUp func(ctx context.Context, chatID int64) error
+	IsNutritionLogBot bool
+	HasDedicatedLog   bool
 }
 
 func NewHandler(store *store.Store, provider llm.Provider, sender Sender, bot *tgbotapi.BotAPI, cfg HandlerConfig) *Handler {
@@ -67,15 +80,24 @@ func NewHandler(store *store.Store, provider llm.Provider, sender Sender, bot *t
 	if historyLimit <= 0 {
 		historyLimit = 20
 	}
+	var tools toolExecutor
+	if cfg.AgentConfig != nil && strings.EqualFold(cfg.AgentConfig.Name, "nutrition") {
+		tools = newNutritionToolExecutor(store, cfg.AgentConfig)
+	}
 	return &Handler{
-		store:        store,
-		provider:     provider,
-		sender:       sender,
-		bot:          bot,
-		mode:         map[int64]string{},
-		agent:        cfg.Agent,
-		historyLimit: historyLimit,
-		prompt:       cfg.Prompt,
+		store:             store,
+		provider:          provider,
+		sender:            sender,
+		bot:               bot,
+		mode:              map[int64]string{},
+		agent:             cfg.Agent,
+		historyLimit:      historyLimit,
+		prompt:            cfg.Prompt,
+		agentConfig:       cfg.AgentConfig,
+		nutritionFollowUp: cfg.NutritionFollowUp,
+		isNutritionLogBot: cfg.IsNutritionLogBot,
+		hasDedicatedLog:   cfg.HasDedicatedLog,
+		tools:             tools,
 	}
 }
 
@@ -101,8 +123,12 @@ func (h *Handler) Run(ctx context.Context) error {
 func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) error {
 	text := strings.TrimSpace(extractMessageText(msg))
 	chatID := msg.Chat.ID
+	isLogChat := h.isNutritionLogChat(chatID)
 	switch {
 	case text == "/start":
+		if isLogChat {
+			return h.sender.SendMessage(ctx, chatID, h.nutritionLogPrompt())
+		}
 		if h.agent != "" {
 			return h.sender.SendMessage(ctx, chatID, fmt.Sprintf("Welcome to LifeOps %s bot! Ask me anything.", h.agent))
 		}
@@ -126,7 +152,7 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) erro
 	if agent == "" {
 		agent = "coach"
 	}
-	if agent == "nutrition" {
+	if h.shouldLogNutrition(agent, chatID) {
 		return h.handleNutritionLog(ctx, agent, msg, text)
 	}
 	history, err := h.store.ChatHistory(ctx, chatID, agent, h.historyLimit)
@@ -136,21 +162,76 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) erro
 	if err := h.store.SaveChatMessage(ctx, chatID, agent, "user", text); err != nil {
 		return err
 	}
-	systemPrompt := ResolvePrompt(agent, h.prompt)
-	messages := buildConversation(systemPrompt, history, text)
-	resp, err := h.provider.Chat(ctx, llm.ChatRequest{
-		Messages: messages,
-	})
+	resp, err := h.generateLLMResponse(ctx, agent, history, text, chatID)
 	if err != nil {
 		return err
 	}
-	if resp.Content == "" {
-		return fmt.Errorf("llm returned empty response")
-	}
-	if err := h.store.SaveChatMessage(ctx, chatID, agent, "assistant", resp.Content); err != nil {
+	if err := h.store.SaveChatMessage(ctx, chatID, agent, "assistant", resp); err != nil {
 		return err
 	}
-	return h.sender.SendMessage(ctx, chatID, resp.Content)
+	return h.sender.SendMessage(ctx, chatID, resp)
+}
+
+func (h *Handler) generateLLMResponse(ctx context.Context, agent string, history []store.ChatMessage, userMessage string, chatID int64) (string, error) {
+	systemPrompt := ResolvePrompt(agent, h.prompt)
+	messages := buildConversation(systemPrompt, history, userMessage)
+	exec := h.toolExecutorForAgent(agent)
+	req := llm.ChatRequest{
+		Messages: append([]llm.ChatMessage(nil), messages...),
+	}
+	if exec != nil {
+		req.Tools = exec.Definitions()
+		req.MaxToolCalls = 4
+	}
+	content, err := h.runChatWithTools(ctx, req, exec, chatID)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(content) == "" {
+		return "", fmt.Errorf("llm returned empty response")
+	}
+	return strings.TrimSpace(content), nil
+}
+
+func (h *Handler) toolExecutorForAgent(agent string) toolExecutor {
+	if h.tools == nil {
+		return nil
+	}
+	if strings.EqualFold(agent, "nutrition") {
+		return h.tools
+	}
+	return nil
+}
+
+func (h *Handler) runChatWithTools(ctx context.Context, req llm.ChatRequest, exec toolExecutor, chatID int64) (string, error) {
+	for i := 0; i < handlerMaxToolIterations; i++ {
+		resp, err := h.provider.Chat(ctx, req)
+		if err != nil {
+			return "", err
+		}
+		if len(resp.ToolCalls) == 0 {
+			return resp.Content, nil
+		}
+		if exec == nil {
+			return "", fmt.Errorf("tool call requested but no executor configured")
+		}
+		req.Messages = append(req.Messages, llm.ChatMessage{
+			Role:      "assistant",
+			ToolCalls: resp.ToolCalls,
+		})
+		for _, call := range resp.ToolCalls {
+			output, err := exec.Execute(ctx, chatID, call.Name, call.Arguments)
+			if err != nil {
+				output = fmt.Sprintf("tool %s error: %v", call.Name, err)
+			}
+			req.Messages = append(req.Messages, llm.ChatMessage{
+				Role:       "tool",
+				ToolCallID: call.ID,
+				Content:    output,
+			})
+		}
+	}
+	return "", fmt.Errorf("tool call loop exceeded %d iterations", handlerMaxToolIterations)
 }
 
 type nutritionExtraction struct {
@@ -164,11 +245,10 @@ type nutritionExtraction struct {
 
 func (h *Handler) handleNutritionLog(ctx context.Context, agent string, msg *tgbotapi.Message, text string) error {
 	chatID := msg.Chat.ID
+	isLogChat := h.isNutritionLogChat(chatID)
+	storageChatID := h.storageNutritionChatID(chatID)
 	if strings.TrimSpace(text) == "" {
 		return h.sender.SendMessage(ctx, chatID, "Добавь короткое описание того, что ты ел или пил.")
-	}
-	if err := h.store.SaveChatMessage(ctx, chatID, agent, "user", text); err != nil {
-		return err
 	}
 	hasPhoto := len(msg.Photo) > 0
 	prompt := buildNutritionExtractionPrompt(text, hasPhoto)
@@ -186,7 +266,7 @@ func (h *Handler) handleNutritionLog(ctx context.Context, agent string, msg *tgb
 		parsed.Summary = text
 	}
 	entry := store.NutritionEntry{
-		ChatID:       chatID,
+		ChatID:       storageChatID,
 		MessageTS:    time.Unix(int64(msg.Date), 0).UTC(),
 		OriginalText: text,
 		Summary:      strings.TrimSpace(parsed.Summary),
@@ -201,10 +281,14 @@ func (h *Handler) handleNutritionLog(ctx context.Context, agent string, msg *tgb
 		return err
 	}
 	reply := buildNutritionAck(parsed)
-	if err := h.store.SaveChatMessage(ctx, chatID, agent, "assistant", reply); err != nil {
+	if !isLogChat && h.shouldTriggerNutritionReview(agent) {
+		reply = strings.TrimSpace(reply + "\nСоберу данные за день и скоро пришлю рекомендации.")
+	}
+	if err := h.sender.SendMessage(ctx, chatID, reply); err != nil {
 		return err
 	}
-	return h.sender.SendMessage(ctx, chatID, reply)
+	h.triggerNutritionReview(agent, chatID)
+	return nil
 }
 
 func buildConversation(systemPrompt string, history []store.ChatMessage, userMessage string) []llm.ChatMessage {
@@ -273,6 +357,85 @@ func extractPhotoFileID(msg *tgbotapi.Message) string {
 	return photo.FileID
 }
 
+func (h *Handler) shouldTriggerNutritionReview(agent string) bool {
+	if !strings.EqualFold(agent, "nutrition") {
+		return false
+	}
+	return h.agentConfig != nil && h.nutritionFollowUp != nil && strings.EqualFold(h.agentConfig.Name, "nutrition")
+}
+
+func (h *Handler) isNutritionLogChat(chatID int64) bool {
+	if h.isNutritionLogBot {
+		return true
+	}
+	if h.hasDedicatedLog {
+		return false
+	}
+	if h.agentConfig == nil || !strings.EqualFold(h.agentConfig.Name, "nutrition") {
+		return false
+	}
+	if h.agentConfig.NutritionLogChatID == 0 {
+		return false
+	}
+	return h.agentConfig.NutritionLogChatID == chatID
+}
+
+func (h *Handler) nutritionLogPrompt() string {
+	if h.agentConfig != nil {
+		if prompt := strings.TrimSpace(h.agentConfig.NutritionLogPrompt); prompt != "" {
+			return prompt
+		}
+	}
+	return "Это дневник питания. Просто опиши, что ты ел или пил, и я всё запишу."
+}
+
+func (h *Handler) triggerNutritionReview(agent string, chatID int64) {
+	if !h.shouldTriggerNutritionReview(agent) {
+		return
+	}
+	targets := h.nutritionReviewTargets(chatID)
+	for _, target := range targets {
+		targetID := target
+		go func() {
+			runCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			if err := h.nutritionFollowUp(runCtx, targetID); err != nil {
+				log.Printf("nutrition follow-up: %v", err)
+			}
+		}()
+	}
+}
+
+func (h *Handler) shouldLogNutrition(agent string, chatID int64) bool {
+	if !strings.EqualFold(agent, "nutrition") {
+		return false
+	}
+	if h.isNutritionLogBot {
+		return true
+	}
+	if h.hasDedicatedLog {
+		return false
+	}
+	if h.agentConfig == nil || h.agentConfig.NutritionLogChatID == 0 {
+		return false
+	}
+	return h.agentConfig.NutritionLogChatID == chatID
+}
+
+func (h *Handler) nutritionReviewTargets(fallback int64) []int64 {
+	if h.agentConfig == nil || h.agentConfig.NutritionReviewChatID == 0 {
+		return []int64{fallback}
+	}
+	return []int64{h.agentConfig.NutritionReviewChatID}
+}
+
+func (h *Handler) storageNutritionChatID(chatID int64) int64 {
+	if h.agentConfig != nil && h.agentConfig.NutritionLogChatID != 0 {
+		return h.agentConfig.NutritionLogChatID
+	}
+	return chatID
+}
+
 func buildNutritionAck(parsed nutritionExtraction) string {
 	var builder strings.Builder
 	builder.WriteString("Записал приём пищи: ")
@@ -293,10 +456,6 @@ func buildNutritionAck(parsed nutritionExtraction) string {
 	if len(parts) > 0 {
 		builder.WriteString("\n")
 		builder.WriteString(strings.Join(parts, ", "))
-	}
-	if strings.TrimSpace(parsed.Notes) != "" {
-		builder.WriteString("\n")
-		builder.WriteString(strings.TrimSpace(parsed.Notes))
 	}
 	return builder.String()
 }

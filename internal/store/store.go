@@ -77,6 +77,20 @@ type NutritionEntry struct {
 	CreatedAt    time.Time
 }
 
+type CalendarEvent struct {
+	ID              string
+	CalendarID      string
+	EventUID        string
+	Title           string
+	Description     string
+	Location        string
+	Start           time.Time
+	End             time.Time
+	AllDay          bool
+	SourceUpdatedAt *time.Time
+	Raw             json.RawMessage
+}
+
 func (s *Store) InsertNutritionEntry(ctx context.Context, entry NutritionEntry) (int64, error) {
 	if entry.Raw == nil {
 		entry.Raw = json.RawMessage(`{}`)
@@ -104,7 +118,7 @@ func (s *Store) RecentNutritionEntries(ctx context.Context, chatID int64, since 
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, chat_id, message_ts, original_text, summary, calories, protein_g, carbs_g, fat_g, photo_file_id, raw_payload, created_at
 		FROM nutrition_entries
-		WHERE message_ts >= $1 AND ($2 = 0 OR chat_id = $2)
+		WHERE message_ts >= $1 AND ($2 = 0::bigint OR chat_id = $2)
 		ORDER BY message_ts DESC
 		LIMIT $3
 	`, since, chatID, limit)
@@ -285,6 +299,64 @@ func (s *Store) UpsertMetrics(ctx context.Context, metrics []Metric) (UpsertStat
 	return stats, nil
 }
 
+func (s *Store) UpsertCalendarEvents(ctx context.Context, events []CalendarEvent) (UpsertStats, error) {
+	var stats UpsertStats
+	if len(events) == 0 {
+		return stats, nil
+	}
+	batch := &pgx.Batch{}
+	for _, ev := range events {
+		if ev.Raw == nil {
+			ev.Raw = json.RawMessage(`{}`)
+		}
+		batch.Queue(`
+			INSERT INTO calendar_events
+				(id, calendar_id, event_uid, starts_at, ends_at, all_day, title, description, location, source_updated_at, raw_payload)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			ON CONFLICT (id) DO UPDATE
+			SET calendar_id = EXCLUDED.calendar_id,
+				event_uid = EXCLUDED.event_uid,
+				starts_at = EXCLUDED.starts_at,
+				ends_at = EXCLUDED.ends_at,
+				all_day = EXCLUDED.all_day,
+				title = EXCLUDED.title,
+				description = EXCLUDED.description,
+				location = EXCLUDED.location,
+				source_updated_at = EXCLUDED.source_updated_at,
+				raw_payload = EXCLUDED.raw_payload,
+				updated_at = NOW(),
+				deleted_at = NULL
+			RETURNING (xmax = 0) AS inserted
+		`,
+			ev.ID,
+			ev.CalendarID,
+			ev.EventUID,
+			ev.Start,
+			ev.End,
+			ev.AllDay,
+			nullIfEmpty(ev.Title),
+			nullIfEmpty(ev.Description),
+			nullIfEmpty(ev.Location),
+			ev.SourceUpdatedAt,
+			ev.Raw,
+		)
+	}
+	br := s.pool.SendBatch(ctx, batch)
+	defer br.Close()
+	for range events {
+		var inserted bool
+		if err := br.QueryRow().Scan(&inserted); err != nil {
+			return stats, fmt.Errorf("upsert calendar events: %w", err)
+		}
+		if inserted {
+			stats.Inserted++
+		} else {
+			stats.Updated++
+		}
+	}
+	return stats, nil
+}
+
 func (s *Store) RecentWorkouts(ctx context.Context, since time.Time, limit int) ([]Workout, error) {
 	if limit <= 0 {
 		limit = 10
@@ -397,6 +469,76 @@ func (s *Store) RecentMetrics(ctx context.Context, since time.Time, limit int, k
 			m.Raw = json.RawMessage(raw)
 		}
 		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CalendarEventsBetween(ctx context.Context, calendarID string, start, end time.Time, limit int) ([]CalendarEvent, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+		SELECT id, calendar_id, event_uid, title, description, location, starts_at, ends_at, all_day, source_updated_at, raw_payload
+		FROM calendar_events
+		WHERE deleted_at IS NULL
+		  AND ends_at >= $1
+		  AND starts_at <= $2
+	`
+	args := []any{start, end}
+	argPos := 3
+	if strings.TrimSpace(calendarID) != "" {
+		query += fmt.Sprintf(" AND calendar_id = $%d", argPos)
+		args = append(args, calendarID)
+		argPos++
+	}
+	query += fmt.Sprintf(" ORDER BY starts_at ASC LIMIT $%d", argPos)
+	args = append(args, limit)
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("calendar events: %w", err)
+	}
+	defer rows.Close()
+	var out []CalendarEvent
+	for rows.Next() {
+		var (
+			title   sql.NullString
+			desc    sql.NullString
+			loc     sql.NullString
+			raw     []byte
+			updated sql.NullTime
+			ev      CalendarEvent
+		)
+		if err := rows.Scan(
+			&ev.ID,
+			&ev.CalendarID,
+			&ev.EventUID,
+			&title,
+			&desc,
+			&loc,
+			&ev.Start,
+			&ev.End,
+			&ev.AllDay,
+			&updated,
+			&raw,
+		); err != nil {
+			return nil, fmt.Errorf("calendar events scan: %w", err)
+		}
+		if title.Valid {
+			ev.Title = title.String
+		}
+		if desc.Valid {
+			ev.Description = desc.String
+		}
+		if loc.Valid {
+			ev.Location = loc.String
+		}
+		if updated.Valid {
+			ev.SourceUpdatedAt = &updated.Time
+		}
+		if len(raw) > 0 {
+			ev.Raw = json.RawMessage(raw)
+		}
+		out = append(out, ev)
 	}
 	return out, rows.Err()
 }
@@ -668,4 +810,19 @@ func nullIfEmpty(value string) interface{} {
 		return nil
 	}
 	return value
+}
+
+func (s *Store) ReassignNutritionChatID(ctx context.Context, from, to int64) (int64, error) {
+	if from == 0 || to == 0 {
+		return 0, fmt.Errorf("from/to chat ids must be non-zero")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE nutrition_entries
+		SET chat_id = $2
+		WHERE chat_id = $1
+	`, from, to)
+	if err != nil {
+		return 0, fmt.Errorf("reassign nutrition chat id: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }

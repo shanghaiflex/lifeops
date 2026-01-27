@@ -8,6 +8,7 @@ Local MVP backend for personal life analytics (Health Bridge ingest + finance CS
 - Daily Telegram digest via LLM provider (OpenAI or mock).
 - Telegram bots per agent with separate chat history/context.
 - Nutritionist Telegram bot that logs every meal (text + optional photo), stores calories/macрос in Postgres, and exposes the data as a tool for other agents (e.g. the coach).
+- Periodic Yandex Calendar sync that keeps events in Postgres and exposes them via the `retrieve_calendar_events` tool.
 
 ## Requirements
 - Docker + Docker Compose
@@ -27,6 +28,8 @@ Minimum variables:
 - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (optional unless you need Telegram features)
 - `TELEGRAM_BOT_TOKENS` (optional for multi-bot setup)
 - `TELEGRAM_AGENT_CONFIG_DIR` (optional, defaults to `./data/telegram_agents`)
+- `CALENDAR_SOURCES` (comma-separated `calendar_id=ICS_URL` pairs for the Yandex calendars you want to sync)
+- `CALENDAR_SYNC_INTERVAL` / `CALENDAR_LOOKBACK_DAYS` / `CALENDAR_LOOKAHEAD_DAYS` (optional tuning knobs for the calendar syncer)
 - `LLM_PROVIDER=mock|openai`
 - `OPENAI_API_KEY` (required if `LLM_PROVIDER=openai`)
 - `OPENAI_MODEL` (default `gpt-5-mini`)
@@ -75,6 +78,28 @@ make worker-once
 
 Run continuously via Docker Compose (service `worker`).
 
+## Yandex Calendar sync
+
+Set `CALENDAR_SOURCES` in `.env`, for example:
+
+```
+CALENDAR_SOURCES=personal=https://calendar.yandex.ru/users/me/calendar.ics,work=https://calendar.yandex.ru/users/work/calendar.ics
+```
+
+Optional knobs:
+
+- `CALENDAR_LOOKBACK_DAYS` — how many past days are re-synced (default `3`).
+- `CALENDAR_LOOKAHEAD_DAYS` — how many days ahead to ingest (default `14`).
+- `CALENDAR_SYNC_INTERVAL` — polling interval (Go duration, default `30m`).
+
+Run the syncer locally:
+
+```bash
+go run ./cmd/lifeops calendar-sync
+```
+
+…or rely on the included `calendar` service in `docker-compose.yml`. Once synced, agents can fetch meetings via the `retrieve_calendar_events` tool just like other data sources.
+
 ## Telegram bot
 Run via Docker Compose (`bot` service) or locally:
 
@@ -114,9 +139,13 @@ Each agent gets its own bot and its own chat history/context, and daily reviews 
 Each YAML file supports:
 - `prompt`: the system prompt for chat.
 - `timezone`: IANA timezone name for the daily review schedule (defaults to `Europe/Moscow`).
-- `daily_review_time`: time of day (`HH:MM`) for the daily review.
+- `daily_review_time`: legacy single time (`HH:MM`) for the daily review.
+- `daily_review_times`: optional comma/semicolon/newline-separated list of times (e.g. `"09:00,21:00"`). When present it overrides `daily_review_time` so the worker can run multiple times per day.
 - `daily_review_prompt`: prompt text for the daily review. The worker automatically appends instructions describing every available tool, so keep this field focused on tone/style.
 - `telegram_token` / `chat_id`: you can point these to environment variables using `${ENV_VAR_NAME}` or `env:ENV_VAR_NAME` so actual secrets stay in your `.env`. Example: `telegram_token: ${COACH_TELEGRAM_TOKEN}`. All env values are resolved automatically when configs are loaded.
+- `nutrition_log_chat_id` / `nutrition_review_chat_id` (nutrition agent only): optional per-role chat IDs (or env references). Messages from the `nutrition_log_chat_id` are treated purely as meal logs (photo + short text) and never trigger LLM chit-chat, while the `nutrition_review_chat_id` is where the nutritionist sends summaries and you can discuss the advice. If you leave these values empty, the bot falls back to the single-chat legacy behavior.
+- `nutrition_log_telegram_token` / `nutrition_review_telegram_token` (nutrition agent only): optional bot tokens, so you can run a dedicated logger bot (accepts food photos+captions) and a separate review bot (LLM chat + daily summaries). When omitted, they reuse the standard `telegram_token`.
+- `nutrition_log_prompt` / `nutrition_review_prompt` (nutrition agent only): optional custom copy for each bot. `nutrition_log_prompt` is the greeting/instruction sent by the logger bot (e.g., “Просто пришли фото блюда и пару слов”). `nutrition_review_prompt` overrides the LLM system prompt that powers the review bot and worker summaries.
 
 Example:
 
@@ -126,7 +155,7 @@ name: focus
 prompt: |
   Ты ассистент по продуктивности.
 timezone: Europe/Moscow
-daily_review_time: "09:00"
+daily_review_times: "09:00,21:00"
   daily_review_prompt: |
     Составь краткий обзор продуктивности за день.
     Получи свежие данные через доступные инструменты и сформулируй рекомендации.
