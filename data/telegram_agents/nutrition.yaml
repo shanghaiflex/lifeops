@@ -1,4 +1,5 @@
 name: nutrition
+telegram_token: ${NUTRITION_REVIEW_TELEGRAM_TOKEN}
 chat_id: ${NUTRITION_TELEGRAM_CHAT_ID}
 nutrition_log_chat_id: ${NUTRITION_LOG_CHAT_ID}
 nutrition_review_chat_id: ${NUTRITION_REVIEW_CHAT_ID}
