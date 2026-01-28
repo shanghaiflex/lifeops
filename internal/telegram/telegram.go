@@ -80,9 +80,10 @@ func NewHandler(store *store.Store, provider llm.Provider, sender Sender, bot *t
 	if historyLimit <= 0 {
 		historyLimit = 20
 	}
+	// Create universal tool executor for all agents (not just nutrition)
 	var tools toolExecutor
-	if cfg.AgentConfig != nil && strings.EqualFold(cfg.AgentConfig.Name, "nutrition") {
-		tools = newNutritionToolExecutor(store, cfg.AgentConfig)
+	if cfg.AgentConfig != nil {
+		tools = newUniversalToolExecutor(store, cfg.AgentConfig)
 	}
 	return &Handler{
 		store:             store,
@@ -194,13 +195,8 @@ func (h *Handler) generateLLMResponse(ctx context.Context, agent string, history
 }
 
 func (h *Handler) toolExecutorForAgent(agent string) toolExecutor {
-	if h.tools == nil {
-		return nil
-	}
-	if strings.EqualFold(agent, "nutrition") {
-		return h.tools
-	}
-	return nil
+	// All agents now have access to all tools
+	return h.tools
 }
 
 func (h *Handler) runChatWithTools(ctx context.Context, req llm.ChatRequest, exec toolExecutor, chatID int64) (string, error) {

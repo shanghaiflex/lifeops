@@ -91,6 +91,12 @@ func (s *Server) handleWorkouts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("ingest workouts: %d items (%d inserted, %d updated), %d deletions", len(payload.Items), stats.Inserted, stats.Updated, len(payload.Deleted))
+
+	// Trigger coach agent notification if new workouts were added
+	if stats.Inserted > 0 || stats.Updated > 0 {
+		s.triggerAgentNotification("coach")
+	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -106,6 +112,12 @@ func (s *Server) handleSleep(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("ingest sleep: %d items (%d inserted, %d updated), %d deletions", len(payload.Items), stats.Inserted, stats.Updated, len(payload.Deleted))
+
+	// Trigger sleep agent notification if new sleep sessions were added
+	if stats.Inserted > 0 || stats.Updated > 0 {
+		s.triggerAgentNotification("sleep")
+	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -267,4 +279,51 @@ func logMetricSamples(items []health.Metric) {
 	if len(items) > metricLogPreviewLimit {
 		log.Printf("ingest metrics detail truncated: logged first %d of %d items", metricLogPreviewLimit, len(items))
 	}
+}
+
+// triggerAgentNotification sends a proactive message from the specified agent based on new data
+func (s *Server) triggerAgentNotification(agentName string) {
+	go func() {
+		agentCfg, ok := s.cfg.TelegramAgents[agentName]
+		if !ok {
+			log.Printf("trigger %s notification: agent not configured", agentName)
+			return
+		}
+
+		token := strings.TrimSpace(agentCfg.TelegramToken)
+		if token == "" && len(s.cfg.TelegramBotTokens) > 0 {
+			if fallback, ok := s.cfg.TelegramBotTokens[agentName]; ok {
+				token = strings.TrimSpace(fallback)
+			}
+		}
+
+		// For nutrition agent, use review token if available
+		if strings.EqualFold(agentName, "nutrition") {
+			if reviewToken := strings.TrimSpace(agentCfg.NutritionReviewTelegramToken); reviewToken != "" {
+				token = reviewToken
+			}
+		}
+
+		if token == "" {
+			log.Printf("trigger %s notification: no telegram token configured", agentName)
+			return
+		}
+
+		sender, err := telegram.NewBotSender(token)
+		if err != nil {
+			log.Printf("trigger %s notification: create sender: %v", agentName, err)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		workerInstance := worker.New(s.store, s.provider, sender, agentCfg, s.cfg.ChatHistoryLimit, agentCfg.DefaultChatIDs)
+		if err := workerInstance.RunOnce(ctx); err != nil {
+			log.Printf("trigger %s notification: %v", agentName, err)
+			return
+		}
+
+		log.Printf("trigger %s notification: sent successfully", agentName)
+	}()
 }
