@@ -227,7 +227,7 @@ func (u *universalToolExecutor) retrieveWorkouts(ctx context.Context, raw json.R
 	}
 	payload := map[string]any{
 		"lookback_days": args.LookbackDays,
-		"items":         serializeWorkouts(workouts),
+		"items":         serializeWorkoutsWithTZ(workouts, u.timezone),
 	}
 	return marshalToolPayload(payload)
 }
@@ -245,7 +245,7 @@ func (u *universalToolExecutor) retrieveSleepSessions(ctx context.Context, raw j
 	}
 	payload := map[string]any{
 		"lookback_days": args.LookbackDays,
-		"items":         serializeSleep(data),
+		"items":         serializeSleepWithTZ(data, u.timezone),
 	}
 	return marshalToolPayload(payload)
 }
@@ -264,7 +264,7 @@ func (u *universalToolExecutor) retrieveMetrics(ctx context.Context, raw json.Ra
 	payload := map[string]any{
 		"lookback_days": args.LookbackDays,
 		"kinds":         args.Kinds,
-		"items":         serializeMetrics(data),
+		"items":         serializeMetricsWithTZ(data, u.timezone),
 	}
 	return marshalToolPayload(payload)
 }
@@ -402,13 +402,22 @@ func (c *calendarArgs) applyDefaults() {
 }
 
 func serializeWorkouts(workouts []store.Workout) []map[string]any {
+	return serializeWorkoutsWithTZ(workouts, time.UTC)
+}
+
+func serializeWorkoutsWithTZ(workouts []store.Workout, loc *time.Location) []map[string]any {
+	if loc == nil {
+		loc = time.UTC
+	}
 	out := make([]map[string]any, 0, len(workouts))
 	for _, w := range workouts {
+		start := w.Start.In(loc)
+		end := w.End.In(loc)
 		item := map[string]any{
 			"id":               w.ID,
 			"type":             w.WorkoutType,
-			"start":            w.Start.Format(time.RFC3339),
-			"end":              w.End.Format(time.RFC3339),
+			"start":            start.Format(time.RFC3339),
+			"end":              end.Format(time.RFC3339),
 			"duration_minutes": w.DurationMinutes,
 		}
 		if w.DistanceMeters != nil {
@@ -426,12 +435,21 @@ func serializeWorkouts(workouts []store.Workout) []map[string]any {
 }
 
 func serializeSleep(sessions []store.Sleep) []map[string]any {
+	return serializeSleepWithTZ(sessions, time.UTC)
+}
+
+func serializeSleepWithTZ(sessions []store.Sleep, loc *time.Location) []map[string]any {
+	if loc == nil {
+		loc = time.UTC
+	}
 	out := make([]map[string]any, 0, len(sessions))
 	for _, s := range sessions {
+		start := s.Start.In(loc)
+		end := s.End.In(loc)
 		item := map[string]any{
 			"id":            s.ID,
-			"start":         s.Start.Format(time.RFC3339),
-			"end":           s.End.Format(time.RFC3339),
+			"start":         start.Format(time.RFC3339),
+			"end":           end.Format(time.RFC3339),
 			"total_minutes": s.TotalMinutes,
 			"breakdown": map[string]any{
 				"rem":   s.RemMinutes,
@@ -446,15 +464,24 @@ func serializeSleep(sessions []store.Sleep) []map[string]any {
 }
 
 func serializeMetrics(metrics []store.Metric) []map[string]any {
+	return serializeMetricsWithTZ(metrics, time.UTC)
+}
+
+func serializeMetricsWithTZ(metrics []store.Metric, loc *time.Location) []map[string]any {
+	if loc == nil {
+		loc = time.UTC
+	}
 	out := make([]map[string]any, 0, len(metrics))
 	for _, m := range metrics {
+		start := m.Start.In(loc)
+		end := m.End.In(loc)
 		item := map[string]any{
 			"id":    m.ID,
 			"kind":  m.Kind,
 			"value": m.Value,
 			"unit":  m.Unit,
-			"start": m.Start.Format(time.RFC3339),
-			"end":   m.End.Format(time.RFC3339),
+			"start": start.Format(time.RFC3339),
+			"end":   end.Format(time.RFC3339),
 		}
 		out = append(out, item)
 	}
