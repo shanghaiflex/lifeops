@@ -26,6 +26,7 @@ type SummaryStore interface {
 	ChatHistory(ctx context.Context, chatID int64, agent string, limit int) ([]store.ChatMessage, error)
 	SaveChatMessage(ctx context.Context, chatID int64, agent string, role string, content string) error
 	ChatIDsForAgent(ctx context.Context, agent string) ([]int64, error)
+	GetUserMemories(ctx context.Context, agent string) ([]store.UserMemory, error)
 }
 
 type Worker struct {
@@ -168,6 +169,13 @@ func (w *Worker) runDailyReview(ctx context.Context, chatID int64) error {
 		return err
 	}
 	systemPrompt := telegram.ResolvePrompt(w.agent.Name, w.agent.Prompt)
+	// Load and inject user memories into system prompt
+	memories, err := w.store.GetUserMemories(ctx, w.agent.Name)
+	if err != nil {
+		log.Printf("failed to load memories: %v", err)
+	} else if len(memories) > 0 {
+		systemPrompt = injectMemoriesIntoPrompt(systemPrompt, memories)
+	}
 	dailyPrompt := w.buildDailyPrompt()
 	messages := w.composeMessages(systemPrompt, history, dailyPrompt)
 	if err := w.store.SaveChatMessage(ctx, chatID, w.agent.Name, "user", dailyPrompt); err != nil {
@@ -181,6 +189,22 @@ func (w *Worker) runDailyReview(ctx context.Context, chatID int64) error {
 		return err
 	}
 	return w.sender.SendMessage(ctx, chatID, response)
+}
+
+func injectMemoriesIntoPrompt(systemPrompt string, memories []store.UserMemory) string {
+	if len(memories) == 0 {
+		return systemPrompt
+	}
+	var builder strings.Builder
+	builder.WriteString(systemPrompt)
+	builder.WriteString("\n\n")
+	builder.WriteString("Important facts about the user:\n")
+	for _, mem := range memories {
+		builder.WriteString("- ")
+		builder.WriteString(mem.Content)
+		builder.WriteString("\n")
+	}
+	return builder.String()
 }
 
 func (w *Worker) composeMessages(systemPrompt string, history []store.ChatMessage, dailyPrompt string) []llm.ChatMessage {
@@ -209,12 +233,15 @@ func (w *Worker) composeMessages(systemPrompt string, history []store.ChatMessag
 }
 
 func (w *Worker) buildDailyPrompt() string {
+	now := time.Now().In(w.agent.Timezone)
+	currentTime := fmt.Sprintf("Текущее время: %s", now.Format("2006-01-02 15:04 MST"))
+
 	base := renderDailyReviewPrompt(w.agent.DailyReviewPrompt)
 	tools := w.tools.Describe()
 	if tools == "" {
-		return base
+		return strings.TrimSpace(fmt.Sprintf("%s\n\n%s", currentTime, base))
 	}
-	return strings.TrimSpace(fmt.Sprintf("%s\n\nДоступные инструменты: %s. Вызывай их перед ответом, если нужны свежие данные. После получения данных сделай короткий вывод и рекомендации на русском языке.", base, tools))
+	return strings.TrimSpace(fmt.Sprintf("%s\n\n%s\n\nДоступные инструменты: %s. Вызывай их перед ответом, если нужны свежие данные. После получения данных сделай короткий вывод и рекомендации на русском языке.", currentTime, base, tools))
 }
 
 func dedupInt64(values []int64) []int64 {
