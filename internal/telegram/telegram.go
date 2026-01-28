@@ -80,9 +80,10 @@ func NewHandler(store *store.Store, provider llm.Provider, sender Sender, bot *t
 	if historyLimit <= 0 {
 		historyLimit = 20
 	}
+	// Create universal tool executor for all agents (not just nutrition)
 	var tools toolExecutor
-	if cfg.AgentConfig != nil && strings.EqualFold(cfg.AgentConfig.Name, "nutrition") {
-		tools = newNutritionToolExecutor(store, cfg.AgentConfig)
+	if cfg.AgentConfig != nil {
+		tools = newUniversalToolExecutor(store, cfg.AgentConfig)
 	}
 	return &Handler{
 		store:             store,
@@ -137,6 +138,12 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) erro
 		return h.sender.SendMessage(ctx, chatID, fmt.Sprintf("chat_id=%d", chatID))
 	case text == "/daily":
 		return h.sender.SendMessage(ctx, chatID, "Daily digest will be sent by the worker.")
+	case strings.HasPrefix(text, "/remember "):
+		return h.handleRememberCommand(ctx, chatID, text)
+	case text == "/memories":
+		return h.handleMemoriesCommand(ctx, chatID)
+	case strings.HasPrefix(text, "/forget "):
+		return h.handleForgetCommand(ctx, chatID, text)
 	case text == "/coach", text == "/sleep", text == "/finance", text == "/nutrition":
 		if h.agent != "" {
 			return h.sender.SendMessage(ctx, chatID, fmt.Sprintf("This bot is for %s. Use that bot for chat.", h.agent))
@@ -172,8 +179,74 @@ func (h *Handler) handleMessage(ctx context.Context, msg *tgbotapi.Message) erro
 	return h.sender.SendMessage(ctx, chatID, resp)
 }
 
+func (h *Handler) handleRememberCommand(ctx context.Context, chatID int64, text string) error {
+	memoryText := strings.TrimSpace(strings.TrimPrefix(text, "/remember"))
+	if memoryText == "" {
+		return h.sender.SendMessage(ctx, chatID, "Usage: /remember <something to remember>\nExample: /remember I'm training for a marathon in June")
+	}
+	agent := h.agent
+	if agent == "" {
+		agent = h.mode[chatID]
+	}
+	// Save as global memory (agent = empty string) so all agents can see it
+	_, err := h.store.SaveUserMemory(ctx, memoryText, "")
+	if err != nil {
+		return err
+	}
+	return h.sender.SendMessage(ctx, chatID, fmt.Sprintf("✓ Запомнил: %s", memoryText))
+}
+
+func (h *Handler) handleMemoriesCommand(ctx context.Context, chatID int64) error {
+	agent := h.agent
+	if agent == "" {
+		agent = h.mode[chatID]
+	}
+	if agent == "" {
+		agent = "coach"
+	}
+	memories, err := h.store.GetUserMemories(ctx, agent)
+	if err != nil {
+		return err
+	}
+	if len(memories) == 0 {
+		return h.sender.SendMessage(ctx, chatID, "У меня пока нет сохранённых воспоминаний. Используй /remember чтобы что-то запомнить.")
+	}
+	var response strings.Builder
+	response.WriteString("Сохранённые воспоминания:\n\n")
+	for i, mem := range memories {
+		response.WriteString(fmt.Sprintf("%d. %s (ID: %d)\n", i+1, mem.Content, mem.ID))
+	}
+	response.WriteString("\nИспользуй /forget <ID> чтобы удалить воспоминание")
+	return h.sender.SendMessage(ctx, chatID, response.String())
+}
+
+func (h *Handler) handleForgetCommand(ctx context.Context, chatID int64, text string) error {
+	idStr := strings.TrimSpace(strings.TrimPrefix(text, "/forget"))
+	if idStr == "" {
+		return h.sender.SendMessage(ctx, chatID, "Usage: /forget <ID>\nПример: /forget 1\n\nИспользуй /memories чтобы посмотреть список с ID")
+	}
+	var id int64
+	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+		return h.sender.SendMessage(ctx, chatID, "Неверный ID. Используй /memories чтобы посмотреть список.")
+	}
+	if err := h.store.DeleteUserMemory(ctx, id); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return h.sender.SendMessage(ctx, chatID, "Воспоминание не найдено. Используй /memories чтобы посмотреть список.")
+		}
+		return err
+	}
+	return h.sender.SendMessage(ctx, chatID, "✓ Воспоминание удалено")
+}
+
 func (h *Handler) generateLLMResponse(ctx context.Context, agent string, history []store.ChatMessage, userMessage string, chatID int64) (string, error) {
 	systemPrompt := ResolvePrompt(agent, h.prompt)
+	// Load and inject user memories into system prompt
+	memories, err := h.store.GetUserMemories(ctx, agent)
+	if err != nil {
+		log.Printf("failed to load memories: %v", err)
+	} else if len(memories) > 0 {
+		systemPrompt = injectMemories(systemPrompt, memories)
+	}
 	messages := buildConversation(systemPrompt, history, userMessage)
 	exec := h.toolExecutorForAgent(agent)
 	req := llm.ChatRequest{
@@ -194,13 +267,8 @@ func (h *Handler) generateLLMResponse(ctx context.Context, agent string, history
 }
 
 func (h *Handler) toolExecutorForAgent(agent string) toolExecutor {
-	if h.tools == nil {
-		return nil
-	}
-	if strings.EqualFold(agent, "nutrition") {
-		return h.tools
-	}
-	return nil
+	// All agents now have access to all tools
+	return h.tools
 }
 
 func (h *Handler) runChatWithTools(ctx context.Context, req llm.ChatRequest, exec toolExecutor, chatID int64) (string, error) {
@@ -289,6 +357,22 @@ func (h *Handler) handleNutritionLog(ctx context.Context, agent string, msg *tgb
 	}
 	h.triggerNutritionReview(agent, chatID)
 	return nil
+}
+
+func injectMemories(systemPrompt string, memories []store.UserMemory) string {
+	if len(memories) == 0 {
+		return systemPrompt
+	}
+	var builder strings.Builder
+	builder.WriteString(systemPrompt)
+	builder.WriteString("\n\n")
+	builder.WriteString("Important facts about the user:\n")
+	for _, mem := range memories {
+		builder.WriteString("- ")
+		builder.WriteString(mem.Content)
+		builder.WriteString("\n")
+	}
+	return builder.String()
 }
 
 func buildConversation(systemPrompt string, history []store.ChatMessage, userMessage string) []llm.ChatMessage {

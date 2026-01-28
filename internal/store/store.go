@@ -805,6 +805,13 @@ type ChatMessage struct {
 	Content string
 }
 
+type UserMemory struct {
+	ID        int64
+	Content   string
+	Agent     string // empty = all agents, or specific agent name
+	CreatedAt time.Time
+}
+
 func nullIfEmpty(value string) interface{} {
 	if strings.TrimSpace(value) == "" {
 		return nil
@@ -825,4 +832,56 @@ func (s *Store) ReassignNutritionChatID(ctx context.Context, from, to int64) (in
 		return 0, fmt.Errorf("reassign nutrition chat id: %w", err)
 	}
 	return tag.RowsAffected(), nil
+}
+
+func (s *Store) SaveUserMemory(ctx context.Context, content string, agent string) (int64, error) {
+	var id int64
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO user_memories (content, agent)
+		VALUES ($1, $2)
+		RETURNING id
+	`, strings.TrimSpace(content), nullIfEmpty(agent)).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("save user memory: %w", err)
+	}
+	return id, nil
+}
+
+func (s *Store) GetUserMemories(ctx context.Context, agent string) ([]UserMemory, error) {
+	// Get memories that are either global (agent IS NULL) or specific to this agent
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, content, COALESCE(agent, ''), created_at
+		FROM user_memories
+		WHERE deleted_at IS NULL
+		  AND (agent IS NULL OR agent = $1)
+		ORDER BY created_at DESC
+	`, agent)
+	if err != nil {
+		return nil, fmt.Errorf("get user memories: %w", err)
+	}
+	defer rows.Close()
+	var out []UserMemory
+	for rows.Next() {
+		var mem UserMemory
+		if err := rows.Scan(&mem.ID, &mem.Content, &mem.Agent, &mem.CreatedAt); err != nil {
+			return nil, fmt.Errorf("user memory scan: %w", err)
+		}
+		out = append(out, mem)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteUserMemory(ctx context.Context, id int64) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE user_memories
+		SET deleted_at = NOW()
+		WHERE id = $1 AND deleted_at IS NULL
+	`, id)
+	if err != nil {
+		return fmt.Errorf("delete user memory: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("memory not found")
+	}
+	return nil
 }
