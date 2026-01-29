@@ -475,16 +475,22 @@ func (h *Handler) nutritionLogPrompt() string {
 
 func (h *Handler) triggerNutritionReview(agent string, chatID int64) {
 	if !h.shouldTriggerNutritionReview(agent) {
+		log.Printf("nutrition review not triggered: agent=%s shouldTrigger=%v hasFollowUp=%v",
+			agent, strings.EqualFold(agent, "nutrition"), h.nutritionFollowUp != nil)
 		return
 	}
 	targets := h.nutritionReviewTargets(chatID)
+	log.Printf("nutrition review triggered for agent=%s logChat=%d targets=%v", agent, chatID, targets)
 	for _, target := range targets {
 		targetID := target
 		go func() {
 			runCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
+			log.Printf("nutrition follow-up starting for chat %d", targetID)
 			if err := h.nutritionFollowUp(runCtx, targetID); err != nil {
-				log.Printf("nutrition follow-up: %v", err)
+				log.Printf("nutrition follow-up error for chat %d: %v", targetID, err)
+			} else {
+				log.Printf("nutrition follow-up completed successfully for chat %d", targetID)
 			}
 		}()
 	}

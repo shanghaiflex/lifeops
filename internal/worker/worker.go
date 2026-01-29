@@ -61,6 +61,7 @@ func New(store SummaryStore, provider llm.Provider, sender telegram.Sender, agen
 	reviewTimes = normalizeReviewTimes(reviewTimes)
 	agent.DailyReviewTime = reviewTimes[0]
 	agent.DailyReviewTimes = reviewTimes
+	log.Printf("worker[%s] initialized with defaultChatIDs=%v", agent.Name, defaultChatIDs)
 	return &Worker{
 		store:          store,
 		provider:       provider,
@@ -117,14 +118,17 @@ func (w *Worker) nextReviewTime(after time.Time, inclusive bool) time.Time {
 }
 
 func (w *Worker) RunOnce(ctx context.Context) error {
-	chatIDs, err := w.store.ChatIDsForAgent(ctx, w.agent.Name)
+	dbChatIDs, err := w.store.ChatIDsForAgent(ctx, w.agent.Name)
 	if err != nil {
 		return err
 	}
-	chatIDs = w.resolveChatIDs(chatIDs)
+	chatIDs := w.resolveChatIDs(dbChatIDs)
 	if len(chatIDs) == 0 {
+		log.Printf("worker[%s] no chat IDs resolved (db returned %d, defaults=%v)",
+			w.agent.Name, len(dbChatIDs), w.defaultChatIDs)
 		return nil
 	}
+	log.Printf("worker[%s] running for %d chat(s): %v", w.agent.Name, len(chatIDs), chatIDs)
 	for _, chatID := range chatIDs {
 		if err := w.runDailyReview(ctx, chatID); err != nil {
 			return err
