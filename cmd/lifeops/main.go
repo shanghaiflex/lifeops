@@ -153,6 +153,7 @@ func runBot(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 				log.Printf("telegram bot token missing for agent %s; skipping bot startup", agentName)
 				continue
 			}
+			log.Printf("starting %d bot(s) for agent %s (hasDedicatedLog=%v)", len(tokenRoles), agentName, hasDedicatedLog)
 			var reviewSender telegram.Sender
 			if strings.EqualFold(agentCfg.Name, "nutrition") {
 				reviewToken := strings.TrimSpace(agentCfg.NutritionReviewTelegramToken)
@@ -197,12 +198,18 @@ func runBot(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 						followUpSender := reviewSender
 						if followUpSender == nil {
 							followUpSender = sender
+							log.Printf("nutrition bot: using main sender for followup (reviewSender was nil)")
+						} else {
+							log.Printf("nutrition bot: using dedicated review sender for followup")
 						}
 						if followUpSender != nil {
 							followUp = func(ctx context.Context, chatID int64) error {
 								w := worker.New(store, provider, followUpSender, agentCfg, cfg.ChatHistoryLimit, agentCfg.DefaultChatIDs)
 								return w.RunForChat(ctx, chatID)
 							}
+							log.Printf("nutrition bot: followup function configured (isLog=%v)", role.isLog)
+						} else {
+							log.Printf("nutrition bot: WARNING - followup function NOT configured, followUpSender is nil")
 						}
 					}
 					handler := telegram.NewHandler(store, provider, sender, bot, telegram.HandlerConfig{
