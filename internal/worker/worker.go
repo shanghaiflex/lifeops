@@ -140,9 +140,18 @@ func (w *Worker) RunOnce(ctx context.Context) error {
 func (w *Worker) resolveChatIDs(ids []int64) []int64 {
 	filtered := w.filterReviewChats(ids)
 	if len(filtered) == 0 {
+		// Use configured default chat IDs when no chat history exists
+		// This handles the "cold start" case for new agents
 		filtered = append(filtered, w.defaultChatIDs...)
 	}
-	return dedupInt64(filtered)
+	result := dedupInt64(filtered)
+	if len(result) == 0 && len(ids) > 0 {
+		// Defensive fallback: if we had chat IDs from DB but filtering removed them all,
+		// use the original list (this can happen with nutrition agent filtering)
+		log.Printf("worker[%s] warning: all chat IDs filtered out, using original list", w.agent.Name)
+		return dedupInt64(ids)
+	}
+	return result
 }
 
 func (w *Worker) filterReviewChats(ids []int64) []int64 {
@@ -167,11 +176,13 @@ func (w *Worker) RunForChat(ctx context.Context, chatID int64) error {
 }
 
 func (w *Worker) runDailyReview(ctx context.Context, chatID int64) error {
+	log.Printf("worker[%s] starting daily review for chat %d", w.agent.Name, chatID)
 	w.tools.SetChatContext(chatID)
 	history, err := w.store.ChatHistory(ctx, chatID, w.agent.Name, w.historyLimit)
 	if err != nil {
-		return err
+		return fmt.Errorf("load chat history: %w", err)
 	}
+	log.Printf("worker[%s] loaded %d history messages for chat %d", w.agent.Name, len(history), chatID)
 	systemPrompt := telegram.ResolvePrompt(w.agent.Name, w.agent.Prompt)
 	// Load and inject user memories into system prompt
 	memories, err := w.store.GetUserMemories(ctx, w.agent.Name)
@@ -183,16 +194,21 @@ func (w *Worker) runDailyReview(ctx context.Context, chatID int64) error {
 	dailyPrompt := w.buildDailyPrompt()
 	messages := w.composeMessages(systemPrompt, history, dailyPrompt)
 	if err := w.store.SaveChatMessage(ctx, chatID, w.agent.Name, "user", dailyPrompt); err != nil {
-		return err
+		return fmt.Errorf("save user message: %w", err)
 	}
 	response, err := w.completeWithTools(ctx, messages)
 	if err != nil {
-		return err
+		return fmt.Errorf("generate response: %w", err)
 	}
 	if err := w.store.SaveChatMessage(ctx, chatID, w.agent.Name, "assistant", response); err != nil {
-		return err
+		return fmt.Errorf("save assistant message: %w", err)
 	}
-	return w.sender.SendMessage(ctx, chatID, response)
+	log.Printf("worker[%s] sending message to chat %d (length: %d chars)", w.agent.Name, chatID, len(response))
+	if err := w.sender.SendMessage(ctx, chatID, response); err != nil {
+		return fmt.Errorf("send telegram message: %w", err)
+	}
+	log.Printf("worker[%s] successfully completed daily review for chat %d", w.agent.Name, chatID)
+	return nil
 }
 
 func injectMemoriesIntoPrompt(systemPrompt string, memories []store.UserMemory) string {
