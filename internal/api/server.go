@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -28,12 +29,16 @@ import (
 //go:embed openapi.yaml
 var openapiFS embed.FS
 
+const agentNotificationCooldown = 2 * time.Hour
+
 type Server struct {
-	service  *health.Service
-	router   *chi.Mux
-	store    *store.Store
-	cfg      *config.Config
-	provider llm.Provider
+	service                  *health.Service
+	router                   *chi.Mux
+	store                    *store.Store
+	cfg                      *config.Config
+	provider                 llm.Provider
+	lastAgentNotification    map[string]time.Time
+	lastAgentNotificationMux sync.RWMutex
 }
 
 func NewServer(service *health.Service, store *store.Store, cfg *config.Config, provider llm.Provider) (*Server, error) {
@@ -54,11 +59,12 @@ func NewServer(service *health.Service, store *store.Store, cfg *config.Config, 
 	router := chi.NewRouter()
 	router.Use(openapiMiddleware(openapiRouter))
 	s := &Server{
-		service:  service,
-		router:   router,
-		store:    store,
-		cfg:      cfg,
-		provider: provider,
+		service:               service,
+		router:                router,
+		store:                 store,
+		cfg:                   cfg,
+		provider:              provider,
+		lastAgentNotification: make(map[string]time.Time),
 	}
 	s.routes()
 	return s, nil
@@ -173,6 +179,7 @@ func (s *Server) handleWorkerRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	workerInstance := worker.New(s.store, s.provider, sender, agentCfg, s.cfg.ChatHistoryLimit, agentCfg.DefaultChatIDs)
+	workerInstance.EnableDebug(worker.TriggerManual)
 	if err := workerInstance.RunOnce(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -283,6 +290,22 @@ func logMetricSamples(items []health.Metric) {
 
 // triggerAgentNotification sends a proactive message from the specified agent based on new data
 func (s *Server) triggerAgentNotification(agentName string) {
+	// Check cooldown to prevent spamming messages
+	s.lastAgentNotificationMux.RLock()
+	lastNotification, exists := s.lastAgentNotification[agentName]
+	s.lastAgentNotificationMux.RUnlock()
+
+	if exists && time.Since(lastNotification) < agentNotificationCooldown {
+		log.Printf("trigger %s notification: skipped due to cooldown (last notification %v ago)",
+			agentName, time.Since(lastNotification).Round(time.Minute))
+		return
+	}
+
+	// Update last notification time
+	s.lastAgentNotificationMux.Lock()
+	s.lastAgentNotification[agentName] = time.Now()
+	s.lastAgentNotificationMux.Unlock()
+
 	go func() {
 		agentCfg, ok := s.cfg.TelegramAgents[agentName]
 		if !ok {
@@ -319,6 +342,7 @@ func (s *Server) triggerAgentNotification(agentName string) {
 		defer cancel()
 
 		workerInstance := worker.New(s.store, s.provider, sender, agentCfg, s.cfg.ChatHistoryLimit, agentCfg.DefaultChatIDs)
+		workerInstance.EnableDebug(worker.TriggerDataIngestion)
 		if err := workerInstance.RunOnce(ctx); err != nil {
 			log.Printf("trigger %s notification: %v", agentName, err)
 			return

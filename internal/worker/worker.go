@@ -29,6 +29,27 @@ type SummaryStore interface {
 	GetUserMemories(ctx context.Context, agent string) ([]store.UserMemory, error)
 }
 
+type TriggerType string
+
+const (
+	TriggerScheduled     TriggerType = "scheduled"
+	TriggerDataIngestion TriggerType = "data_ingestion"
+	TriggerManual        TriggerType = "manual"
+)
+
+type DebugInfo struct {
+	TriggerType  TriggerType
+	TriggerTime  time.Time
+	ToolCalls    []ToolCallDebug
+	Enabled      bool
+}
+
+type ToolCallDebug struct {
+	Name      string
+	Arguments string
+	Result    string
+}
+
 type Worker struct {
 	store          SummaryStore
 	provider       llm.Provider
@@ -39,6 +60,7 @@ type Worker struct {
 	tools          *toolRegistry
 	observer       WorkerObserver
 	reviewTimes    []config.DailyReviewTime
+	debugInfo      *DebugInfo
 }
 
 func New(store SummaryStore, provider llm.Provider, sender telegram.Sender, agent config.AgentConfig, historyLimit int, defaultChatIDs []int64) *Worker {
@@ -78,6 +100,15 @@ func (w *Worker) SetObserver(observer WorkerObserver) {
 	w.observer = observer
 }
 
+func (w *Worker) EnableDebug(triggerType TriggerType) {
+	w.debugInfo = &DebugInfo{
+		TriggerType: triggerType,
+		TriggerTime: time.Now(),
+		ToolCalls:   []ToolCallDebug{},
+		Enabled:     true,
+	}
+}
+
 func (w *Worker) RunDaily(ctx context.Context) error {
 	if len(w.reviewTimes) == 0 {
 		return fmt.Errorf("no review times configured")
@@ -88,6 +119,8 @@ func (w *Worker) RunDaily(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Until(next)):
+			// Enable debug mode for scheduled reviews
+			w.EnableDebug(TriggerScheduled)
 			if err := w.RunOnce(ctx); err != nil {
 				return err
 			}
@@ -200,11 +233,16 @@ func (w *Worker) runDailyReview(ctx context.Context, chatID int64) error {
 	if err != nil {
 		return fmt.Errorf("generate response: %w", err)
 	}
+
+	// Append debug information if enabled
+	debugSuffix := w.formatDebugInfo()
+	messageToSend := response + debugSuffix
+
 	if err := w.store.SaveChatMessage(ctx, chatID, w.agent.Name, "assistant", response); err != nil {
 		return fmt.Errorf("save assistant message: %w", err)
 	}
-	log.Printf("worker[%s] sending message to chat %d (length: %d chars)", w.agent.Name, chatID, len(response))
-	if err := w.sender.SendMessage(ctx, chatID, response); err != nil {
+	log.Printf("worker[%s] sending message to chat %d (length: %d chars, debug: %v)", w.agent.Name, chatID, len(messageToSend), w.debugInfo != nil && w.debugInfo.Enabled)
+	if err := w.sender.SendMessage(ctx, chatID, messageToSend); err != nil {
 		return fmt.Errorf("send telegram message: %w", err)
 	}
 	log.Printf("worker[%s] successfully completed daily review for chat %d", w.agent.Name, chatID)
@@ -320,6 +358,16 @@ func (w *Worker) completeWithTools(ctx context.Context, messages []llm.ChatMessa
 			}
 			log.Printf("worker[%s] tool=%s args=%s", w.agent.Name, call.Name, strings.TrimSpace(string(call.Arguments)))
 			w.notifyToolResult(call, output)
+
+			// Collect debug information
+			if w.debugInfo != nil && w.debugInfo.Enabled {
+				w.debugInfo.ToolCalls = append(w.debugInfo.ToolCalls, ToolCallDebug{
+					Name:      call.Name,
+					Arguments: strings.TrimSpace(string(call.Arguments)),
+					Result:    truncateString(output, 500),
+				})
+			}
+
 			req.Messages = append(req.Messages, llm.ChatMessage{
 				Role:       "tool",
 				ToolCallID: call.ID,
@@ -404,4 +452,44 @@ func normalizeReviewTimes(times []config.DailyReviewTime) []config.DailyReviewTi
 		return out[i].Hour < out[j].Hour
 	})
 	return out
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+func (w *Worker) formatDebugInfo() string {
+	if w.debugInfo == nil || !w.debugInfo.Enabled {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n\n---\n")
+	sb.WriteString("🔍 Debug Info:\n")
+
+	// Trigger information
+	switch w.debugInfo.TriggerType {
+	case TriggerScheduled:
+		sb.WriteString(fmt.Sprintf("📅 Scheduled review at %s\n", w.debugInfo.TriggerTime.Format("15:04")))
+	case TriggerDataIngestion:
+		sb.WriteString(fmt.Sprintf("📊 Data ingestion event at %s\n", w.debugInfo.TriggerTime.Format("15:04")))
+	case TriggerManual:
+		sb.WriteString(fmt.Sprintf("🔧 Manual trigger at %s\n", w.debugInfo.TriggerTime.Format("15:04")))
+	}
+
+	// Tool calls
+	if len(w.debugInfo.ToolCalls) > 0 {
+		sb.WriteString(fmt.Sprintf("\n🛠 Tools called (%d):\n", len(w.debugInfo.ToolCalls)))
+		for i, call := range w.debugInfo.ToolCalls {
+			sb.WriteString(fmt.Sprintf("%d. %s\n", i+1, call.Name))
+			if call.Arguments != "" && call.Arguments != "{}" {
+				sb.WriteString(fmt.Sprintf("   Args: %s\n", call.Arguments))
+			}
+		}
+	}
+
+	return sb.String()
 }
