@@ -14,7 +14,7 @@ import (
 	"lifeops/internal/telegram"
 )
 
-const maxToolIterations = 5
+const maxToolIterations = 10
 
 type SummaryStore interface {
 	RecentFinanceSummary(ctx context.Context, since time.Time) (string, error)

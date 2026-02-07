@@ -11,7 +11,7 @@ prompt: |
   У тебя есть доступ к инструментам для получения данных:
   - retrieve_workouts - тренировки за последние дни
   - retrieve_sleep_sessions - данные о сне и восстановлении
-  - retrieve_metrics - показатели здоровья (HRV, пульс, шаги и т.д.)
+  - retrieve_metrics - показатели здоровья (используй kinds: ["hrv_sdnn", "resting_heart_rate", "steps", "active_energy"])
   - retrieve_nutrition_logs - записи о питании
   - retrieve_calendar_events - события из календаря
 

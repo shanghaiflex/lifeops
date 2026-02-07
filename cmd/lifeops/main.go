@@ -84,6 +84,33 @@ func buildProvider(cfg *config.Config) llm.Provider {
 	}
 }
 
+func createBotAPIWithRetry(token string) (*tgbotapi.BotAPI, error) {
+	// Create custom HTTP client with improved timeouts and keep-alive settings
+	httpClient := &http.Client{
+		Timeout: 90 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			MaxConnsPerHost:       10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+
+	bot, err := tgbotapi.NewBotAPI(token)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set custom HTTP client
+	bot.Client = httpClient
+
+	log.Printf("Bot API initialized with improved HTTP client (timeout=90s, keep-alive enabled)")
+	return bot, nil
+}
+
 func runAPI(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 	healthSvc := health.NewService(store)
 	provider := buildProvider(cfg)
@@ -187,7 +214,7 @@ func runBot(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 				role := role
 				started++
 				go func(role *botRole, agentCfg config.AgentConfig, reviewSender telegram.Sender) {
-					bot, err := tgbotapi.NewBotAPI(role.token)
+					bot, err := createBotAPIWithRetry(role.token)
 					if err != nil {
 						errCh <- fmt.Errorf("telegram %s: %w", agentCfg.Name, err)
 						return
@@ -238,7 +265,7 @@ func runBot(ctx context.Context, cfg *config.Config, store *storepkg.Store) {
 		}
 		log.Printf("telegram agent configs present but no valid tokens found; falling back to default bot")
 	}
-	bot, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
+	bot, err := createBotAPIWithRetry(cfg.TelegramToken)
 	if err != nil {
 		log.Fatalf("telegram: %v", err)
 	}

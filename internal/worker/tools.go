@@ -113,7 +113,7 @@ func newToolRegistry(store SummaryStore, timezone *time.Location, nutritionLogCh
 
 	registry.register(llm.ToolDefinition{
 		Name:        "retrieve_metrics",
-		Description: "Возвращает свежие показатели здоровья (HRV, пульс и т.д.). Принимает lookback_days, limit и список kinds.",
+		Description: "Возвращает свежие показатели здоровья (HRV, пульс покоя, шаги и т.д.). Принимает lookback_days, limit и список kinds.",
 		Parameters: map[string]any{
 			"type":                 "object",
 			"additionalProperties": false,
@@ -133,7 +133,7 @@ func newToolRegistry(store SummaryStore, timezone *time.Location, nutritionLogCh
 				},
 				"kinds": map[string]any{
 					"type":        "array",
-					"description": "Фильтр по видам метрик (например, HRV, resting_hr).",
+					"description": "Фильтр по видам метрик. Доступные виды: hrv_sdnn (HRV), resting_heart_rate (пульс покоя), steps (шаги), active_energy (активная энергия).",
 					"items": map[string]any{
 						"type": "string",
 					},

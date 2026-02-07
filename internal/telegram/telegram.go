@@ -19,7 +19,7 @@ type Sender interface {
 	SendMessage(ctx context.Context, chatID int64, text string) error
 }
 
-const handlerMaxToolIterations = 5
+const handlerMaxToolIterations = 10
 
 type NoopSender struct{}
 
